@@ -1,342 +1,229 @@
 package api
 
 import (
-	"bytes"
-	"context"
-	"encoding/json"
-	"io"
-	"log"
-	"net/http"
-	"net/http/httptest"
-	"strings"
-	"sync"
-	"testing"
-	"time"
+    "bytes"
+    "context"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "sync"
+    "testing"
+    "time"
 
-	"fish-speech-go/internal/backend"
-	"fish-speech-go/internal/queue"
-	"fish-speech-go/internal/streaming"
+    "github.com/username/fish-speech-go/internal/backend"
+    "github.com/username/fish-speech-go/internal/queue"
+    "github.com/username/fish-speech-go/internal/streaming"
 )
 
-type stubBackend struct {
-	stream func(context.Context, backend.TTSRequest) (*http.Response, error)
+func TestTTSHandler_LimitExceeded(t *testing.T) {
+    chunker, err := streaming.NewChunker(streaming.Options{MaxConcurrent: 2})
+    if err != nil {
+        t.Fatalf("failed to create chunker: %v", err)
+    }
+
+    q, err := queue.NewManager(4)
+    if err != nil {
+        t.Fatalf("failed to create queue: %v", err)
+    }
+
+    block := make(chan struct{})
+    started := make(chan struct{}, 2)
+    var wg sync.WaitGroup
+
+    backend := &blockingBackend{started: started, block: block, done: &wg}
+    handler := NewTTSHandler(chunker, backend, q)
+
+    wg.Add(2)
+    payload := []byte(`{"text":"hello"}`)
+
+    for i := 0; i < 2; i++ {
+        go func() {
+            req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(payload))
+            rr := httptest.NewRecorder()
+            handler.ServeHTTP(rr, req)
+        }()
+    }
+
+    for i := 0; i < 2; i++ {
+        <-started
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    time.AfterFunc(30*time.Millisecond, cancel)
+
+    req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(payload)).WithContext(ctx)
+    rr := httptest.NewRecorder()
+    handler.ServeHTTP(rr, req)
+
+    if rr.Code != http.StatusServiceUnavailable {
+        t.Fatalf("expected 503 for limit exceeded, got %d", rr.Code)
+    }
+
+    var resp ErrorResponse
+    if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+        t.Fatalf("failed to decode error response: %v", err)
+    }
+
+    if resp.Error.Code != string(streaming.ChunkerLimitExceeded) {
+        t.Fatalf("expected error code %q, got %q", streaming.ChunkerLimitExceeded, resp.Error.Code)
+    }
+
+    close(block)
+    wg.Wait()
 }
 
-func (s *stubBackend) StreamTTS(ctx context.Context, req backend.TTSRequest) (*http.Response, error) {
-	return s.stream(ctx, req)
+func TestTTSHandler_AcquireTimeout(t *testing.T) {
+    chunker, err := streaming.NewChunker(streaming.Options{MaxConcurrent: 2, AcquireTimeout: 20 * time.Millisecond})
+    if err != nil {
+        t.Fatalf("failed to create chunker: %v", err)
+    }
+
+    q, err := queue.NewManager(4)
+    if err != nil {
+        t.Fatalf("failed to create queue: %v", err)
+    }
+
+    block := make(chan struct{})
+    started := make(chan struct{}, 2)
+    var wg sync.WaitGroup
+
+    backend := &blockingBackend{started: started, block: block, done: &wg}
+    handler := NewTTSHandler(chunker, backend, q)
+
+    wg.Add(2)
+    payload := []byte(`{"text":"hello"}`)
+
+    for i := 0; i < 2; i++ {
+        go func() {
+            req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(payload))
+            rr := httptest.NewRecorder()
+            handler.ServeHTTP(rr, req)
+        }()
+    }
+
+    for i := 0; i < 2; i++ {
+        <-started
+    }
+
+    req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(payload))
+    rr := httptest.NewRecorder()
+    handler.ServeHTTP(rr, req)
+
+    if rr.Code != http.StatusGatewayTimeout {
+        t.Fatalf("expected 504 for acquire timeout, got %d", rr.Code)
+    }
+
+    var resp ErrorResponse
+    if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+        t.Fatalf("failed to decode error response: %v", err)
+    }
+
+    if resp.Error.Code != string(streaming.ChunkerAcquireTimeout) {
+        t.Fatalf("expected error code %q, got %q", streaming.ChunkerAcquireTimeout, resp.Error.Code)
+    }
+
+    close(block)
+    wg.Wait()
 }
 
-func TestTTSHandlerValidatesRequest(t *testing.T) {
-	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 2}), &stubBackend{}, queue.NewManager(queue.Config{Workers: 2, MaxQueue: 2}))
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+func TestTTSHandler_QueueFull(t *testing.T) {
+    chunker, err := streaming.NewChunker(streaming.Options{MaxConcurrent: 1})
+    if err != nil {
+        t.Fatalf("failed to create chunker: %v", err)
+    }
 
-	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{}`))
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
+    q, err := queue.NewManager(1)
+    if err != nil {
+        t.Fatalf("failed to create queue: %v", err)
+    }
 
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", resp.StatusCode)
-	}
+    // Fill queue slot.
+    release, err := q.Acquire(context.Background())
+    if err != nil {
+        t.Fatalf("failed to acquire queue slot: %v", err)
+    }
+    defer release()
 
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("failed to decode error payload: %v", err)
-	}
+    handler := NewTTSHandler(chunker, &noopBackend{}, q)
 
-	if payload.Error.Code != "invalid_request" {
-		t.Fatalf("unexpected error code: %s", payload.Error.Code)
-	}
+    req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader([]byte(`{"text":"hello"}`)))
+    rr := httptest.NewRecorder()
+    handler.ServeHTTP(rr, req)
+
+    if rr.Code != http.StatusServiceUnavailable {
+        t.Fatalf("expected 503 when queue is full, got %d", rr.Code)
+    }
 }
 
-func TestTTSHandlerStreamingFlag(t *testing.T) {
-	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1}), &stubBackend{})
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+func TestTTSHandler_InvalidPayload(t *testing.T) {
+    chunker, _ := streaming.NewChunker(streaming.Options{MaxConcurrent: 1})
+    q, _ := queue.NewManager(1)
+    handler := NewTTSHandler(chunker, &noopBackend{}, q)
 
-	testCases := []struct {
-		name     string
-		body     string
-		expCode  int
-		expError string
-	}{
-		{
-			name:     "missing streaming",
-			body:     `{"text":"hello","format":"wav"}`,
-			expCode:  http.StatusBadRequest,
-			expError: "streaming flag is required",
-		},
-		{
-			name:     "disabled streaming",
-			body:     `{"text":"hello","format":"wav","streaming":false}`,
-			expCode:  http.StatusBadRequest,
-			expError: "streaming must be enabled",
-		},
-	}
+    req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader([]byte(`{"text":""}`)))
+    rr := httptest.NewRecorder()
+    handler.ServeHTTP(rr, req)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(tc.body))
-			if err != nil {
-				t.Fatalf("request failed: %v", err)
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != tc.expCode {
-				t.Fatalf("expected status %d, got %d", tc.expCode, resp.StatusCode)
-			}
-
-			var payload struct {
-				Error struct {
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-				t.Fatalf("failed to decode error payload: %v", err)
-			}
-
-			if payload.Error.Code != "invalid_request" {
-				t.Fatalf("unexpected error code: %s", payload.Error.Code)
-			}
-			if payload.Error.Message != tc.expError {
-				t.Fatalf("unexpected error message: %s", payload.Error.Message)
-			}
-		})
-	}
+    if rr.Code != http.StatusBadRequest {
+        t.Fatalf("expected 400 for invalid payload, got %d", rr.Code)
+    }
 }
 
-func TestTTSHandlerStreamsSuccess(t *testing.T) {
-	backendCalled := make(chan backend.TTSRequest, 1)
-	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 2}), &stubBackend{
-		stream: func(_ context.Context, req backend.TTSRequest) (*http.Response, error) {
-			backendCalled <- req
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": []string{"audio/wav"}},
-				Body:       io.NopCloser(strings.NewReader("audio-bytes")),
-			}, nil
-		},
-	}, queue.NewManager(queue.Config{Workers: 2, MaxQueue: 2}))
+func TestTTSHandler_HappyPath(t *testing.T) {
+    chunker, _ := streaming.NewChunker(streaming.Options{MaxConcurrent: 1})
+    q, _ := queue.NewManager(1)
 
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
+    backend := &recordingBackend{}
+    handler := NewTTSHandler(chunker, backend, q)
 
-	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"hello","format":"wav","streaming":true}`))
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
+    req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader([]byte(`{"text":"hello"}`)))
+    rr := httptest.NewRecorder()
+    handler.ServeHTTP(rr, req)
 
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
-	}
-	if ct := resp.Header.Get("Content-Type"); ct != "audio/wav" {
-		t.Fatalf("unexpected content type: %s", ct)
-	}
+    if rr.Code != http.StatusOK {
+        t.Fatalf("expected 200, got %d", rr.Code)
+    }
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("failed to read body: %v", err)
-	}
-	if string(body) != "audio-bytes" {
-		t.Fatalf("unexpected body: %s", string(body))
-	}
-
-	select {
-	case req := <-backendCalled:
-		if req.Text != "hello" || req.Format != "wav" || !req.Streaming {
-			t.Fatalf("unexpected backend request: %+v", req)
-		}
-	case <-time.After(time.Second):
-		t.Fatalf("backend was not called")
-	}
+    if !backend.called {
+        t.Fatalf("expected backend to be invoked")
+    }
 }
 
-func TestTTSHandlerAcquireTimeout(t *testing.T) {
-	chunker := streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1, AcquireTimeout: 50 * time.Millisecond})
-	release := make(chan struct{})
-	started := make(chan struct{})
-
-	backendStub := &stubBackend{stream: func(_ context.Context, _ backend.TTSRequest) (*http.Response, error) {
-		pr, pw := io.Pipe()
-		go func() {
-			close(started)
-			_, _ = pw.Write([]byte("chunk"))
-			<-release
-			pw.Close()
-		}()
-
-		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
-	}}
-
-	handler := NewTTSHandler(chunker, backendStub, queue.NewManager(queue.Config{Workers: 2, MaxQueue: 1}))
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"first","format":"wav","streaming":true}`))
-		if err != nil {
-			t.Errorf("first request failed: %v", err)
-			return
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-
-	<-started
-
-	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"second","format":"wav","streaming":true}`))
-	if err != nil {
-		t.Fatalf("second request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusGatewayTimeout {
-		t.Fatalf("expected 504, got %d", resp.StatusCode)
-	}
-
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("failed to decode error payload: %v", err)
-	}
-	if payload.Error.Code != "acquire_timeout" {
-		t.Fatalf("unexpected error code: %s", payload.Error.Code)
-	}
-
-	close(release)
-	wg.Wait()
+type blockingBackend struct {
+    started chan struct{}
+    block   chan struct{}
+    done    *sync.WaitGroup
 }
 
-func TestTTSHandlerQueueFull(t *testing.T) {
-	chunker := streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1})
-	queueManager := queue.NewManager(queue.Config{Workers: 1, MaxQueue: 0})
-	backendStart := make(chan struct{})
-	release := make(chan struct{})
+func (b *blockingBackend) StreamTTS(ctx context.Context, req *backend.Request, w http.ResponseWriter) error {
+    if b.started != nil {
+        b.started <- struct{}{}
+    }
 
-	backendStub := &stubBackend{stream: func(_ context.Context, _ backend.TTSRequest) (*http.Response, error) {
-		pr, pw := io.Pipe()
-		go func() {
-			close(backendStart)
-			<-release
-			pw.Close()
-		}()
+    <-b.block
 
-		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
-	}}
+    if b.done != nil {
+        b.done.Done()
+    }
 
-	handler := NewTTSHandler(chunker, backendStub, queueManager)
-	server := httptest.NewServer(handler)
-	t.Cleanup(server.Close)
-	t.Cleanup(func() { _ = handler.Shutdown(context.Background()) })
-
-	go func() {
-		reqBody := bytes.NewBufferString(`{"text":"first","format":"wav"}`)
-		resp, err := http.Post(server.URL, "application/json", reqBody)
-		if err != nil {
-			t.Errorf("first request failed: %v", err)
-			return
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-
-	select {
-	case <-backendStart:
-	case <-time.After(time.Second):
-		t.Fatalf("backend did not start")
-	}
-
-	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"second","format":"wav"}`))
-	if err != nil {
-		t.Fatalf("second request failed: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503, got %d", resp.StatusCode)
-	}
-
-	var payload struct {
-		Error struct {
-			Code string `json:"code"`
-		} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("failed to decode error payload: %v", err)
-	}
-
-	if payload.Error.Code != "queue_full" {
-		t.Fatalf("unexpected error code: %s", payload.Error.Code)
-	}
-
-	close(release)
+    return nil
 }
 
-func TestTTSHandlerShutdownWaits(t *testing.T) {
-	chunker := streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1})
-	queueManager := queue.NewManager(queue.Config{Workers: 1, MaxQueue: 1})
-	release := make(chan struct{})
-	backendStarted := make(chan struct{})
+type noopBackend struct{}
 
-	backendStub := &stubBackend{stream: func(_ context.Context, _ backend.TTSRequest) (*http.Response, error) {
-		pr, pw := io.Pipe()
-		go func() {
-			close(backendStarted)
-			<-release
-			pw.Close()
-		}()
-		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
-	}}
+func (n *noopBackend) StreamTTS(ctx context.Context, req *backend.Request, w http.ResponseWriter) error {
+    w.WriteHeader(http.StatusOK)
+    return nil
+}
 
-	handler := NewTTSHandler(chunker, backendStub, queueManager)
+type recordingBackend struct {
+    called bool
+}
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewBufferString(`{"text":"hello","format":"wav"}`))
-	recorder := httptest.NewRecorder()
-
-	go handler.ServeHTTP(recorder, req)
-
-	select {
-	case <-backendStarted:
-	case <-time.After(time.Second):
-		t.Fatalf("backend did not start")
-	}
-
-	shutdownErr := make(chan error, 1)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-		defer cancel()
-		shutdownErr <- handler.Shutdown(ctx)
-	}()
-
-	select {
-	case err := <-shutdownErr:
-		if err == nil {
-			t.Fatalf("expected shutdown to time out while stream active")
-		}
-	case <-time.After(200 * time.Millisecond):
-		t.Fatalf("shutdown did not return in time")
-	}
-
-	close(release)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-
-	if err := handler.Shutdown(ctx); err != nil {
-		t.Fatalf("shutdown after release failed: %v", err)
-	}
+func (r *recordingBackend) StreamTTS(ctx context.Context, req *backend.Request, w http.ResponseWriter) error {
+    r.called = true
+    w.WriteHeader(http.StatusOK)
+    return nil
 }

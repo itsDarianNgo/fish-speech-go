@@ -3,107 +3,134 @@ package streaming
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"time"
 )
 
-var (
-	// ErrAcquireTimeout indicates the chunker could not provide a slot within the configured timeout.
-	ErrAcquireTimeout = errors.New("chunker: acquire timeout")
-	// ErrLimitExceeded indicates the chunker refused a slot because concurrency is exhausted.
-	ErrLimitExceeded = errors.New("chunker: limit exceeded")
+// ChunkerErrorCode enumerates the categories of errors returned by the chunker.
+type ChunkerErrorCode string
+
+const (
+	// ChunkerLimitExceeded indicates that no semaphore slot was available
+	// before the caller timed out or canceled the operation.
+	ChunkerLimitExceeded ChunkerErrorCode = "limit_exceeded"
+	// ChunkerAcquireTimeout indicates that the chunker timed out waiting for a slot
+	// using its configured AcquireTimeout value.
+	ChunkerAcquireTimeout ChunkerErrorCode = "acquire_timeout"
 )
 
-// Chunker limits concurrent streaming operations using a semaphore-style slot pool.
-type Chunker struct {
-	slots          chan struct{}
-	acquireTimeout time.Duration
-	metrics        *Metrics
+// ChunkerError provides structured context about concurrency limiting failures.
+type ChunkerError struct {
+	Code    ChunkerErrorCode
+	Message string
 }
 
-// ChunkerConfig controls how the Chunker gates concurrent access.
-type ChunkerConfig struct {
-	MaxConcurrent  int
+// Error implements the error interface.
+func (e ChunkerError) Error() string {
+	if e.Message != "" {
+		return e.Message
+	}
+	return string(e.Code)
+}
+
+// Is allows errors.Is to match by error code, enabling callers to react to
+// concurrency guardrails without depending on the error message.
+func (e ChunkerError) Is(target error) bool {
+	t, ok := target.(ChunkerError)
+	if ok {
+		return e.Code == t.Code
+	}
+
+	pt, ok := target.(*ChunkerError)
+	if ok && pt != nil {
+		return e.Code == pt.Code
+	}
+
+	return false
+}
+
+var (
+	// ErrLimitExceeded is returned when the chunker cannot obtain a semaphore slot
+	// before the caller cancels the attempt.
+	ErrLimitExceeded = ChunkerError{Code: ChunkerLimitExceeded, Message: "chunker concurrency limit reached"}
+	// ErrAcquireTimeout is returned when the chunker exceeds its internal AcquireTimeout
+	// while waiting for a slot.
+	ErrAcquireTimeout = ChunkerError{Code: ChunkerAcquireTimeout, Message: "timed out waiting for chunker slot"}
+)
+
+// Options configures how the chunker gates concurrent streaming operations.
+type Options struct {
+	// MaxConcurrent defines the maximum number of concurrent streaming tasks allowed.
+	// This value is required and must be greater than zero.
+	MaxConcurrent int
+	// AcquireTimeout defines how long to wait for a semaphore slot before failing with
+	// ErrAcquireTimeout. A zero value disables the internal timeout, leaving the caller's
+	// context to control cancellation.
 	AcquireTimeout time.Duration
-	Metrics        *Metrics
 }
 
-// NewChunker constructs a Chunker with the provided configuration.
-func NewChunker(cfg ChunkerConfig) *Chunker {
-	if cfg.MaxConcurrent <= 0 {
-		cfg.MaxConcurrent = 1
+// Chunker limits the number of concurrent streaming operations using a semaphore.
+type Chunker struct {
+	sem            chan struct{}
+	acquireTimeout time.Duration
+}
+
+// NewChunker initializes a Chunker with the provided options.
+func NewChunker(opts Options) (*Chunker, error) {
+	if opts.MaxConcurrent <= 0 {
+		return nil, fmt.Errorf("MaxConcurrent must be greater than zero")
 	}
+
 	return &Chunker{
-		slots:          make(chan struct{}, cfg.MaxConcurrent),
-		acquireTimeout: cfg.AcquireTimeout,
-		metrics:        cfg.Metrics,
-	}
+		sem:            make(chan struct{}, opts.MaxConcurrent),
+		acquireTimeout: opts.AcquireTimeout,
+	}, nil
 }
 
-// Acquire reserves a slot for work. The returned release function must be called to free the slot.
+// Acquire obtains a semaphore slot respecting context cancellation and the configured
+// AcquireTimeout. It returns a release function that must be called to free the slot.
 func (c *Chunker) Acquire(ctx context.Context) (func(), error) {
-	// Fast path when a slot is immediately available.
-	select {
-	case c.slots <- struct{}{}:
-		return c.onAcquire(), nil
-	default:
+	if ctx == nil {
+		ctx = context.Background()
 	}
 
-	// Slow path waits based on the configured timeout or context cancellation.
-	if c.acquireTimeout <= 0 {
-		select {
-		case c.slots <- struct{}{}:
-			return c.onAcquire(), nil
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-			if c.metrics != nil {
-				c.metrics.IncLimitExceeded()
-			}
-			return nil, ErrLimitExceeded
-		}
+	slotCtx := ctx
+	var cancel context.CancelFunc
+	if c.acquireTimeout > 0 {
+		slotCtx, cancel = context.WithTimeout(ctx, c.acquireTimeout)
+		defer cancel()
 	}
 
-	timer := time.NewTimer(c.acquireTimeout)
-	defer timer.Stop()
-
 	select {
-	case c.slots <- struct{}{}:
-		return c.onAcquire(), nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-timer.C:
-		if c.metrics != nil {
-			c.metrics.IncAcquireTimeouts()
+	case c.sem <- struct{}{}:
+		var once sync.Once
+		release := func() {
+			once.Do(func() {
+				<-c.sem
+			})
 		}
-		return nil, ErrAcquireTimeout
+		return release, nil
+	case <-slotCtx.Done():
+		if errors.Is(slotCtx.Err(), context.DeadlineExceeded) {
+			return nil, ErrAcquireTimeout
+		}
+		return nil, ErrLimitExceeded
 	}
 }
 
-func (c *Chunker) onAcquire() func() {
-	if c.metrics != nil {
-		c.metrics.IncActiveStreams()
-	}
-
-	return func() {
-		select {
-		case <-c.slots:
-		default:
-		}
-
-		if c.metrics != nil {
-			c.metrics.DecActiveStreams()
-		}
-	}
-}
-
-// Stream executes the provided function while holding a slot. The slot is released when the
-// function returns, allowing callers to guard streaming workloads without manual bookkeeping.
-func (c *Chunker) Stream(ctx context.Context, streamFn func(context.Context) error) error {
+// Stream wraps Acquire and executes the producer while holding the semaphore slot.
+// It ensures the slot is released even when the producer returns an error.
+func (c *Chunker) Stream(ctx context.Context, producer func(context.Context) error) error {
 	release, err := c.Acquire(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	return streamFn(ctx)
+	if producer == nil {
+		return nil
+	}
+
+	return producer(ctx)
 }
