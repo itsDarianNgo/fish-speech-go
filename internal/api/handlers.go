@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"time"
 )
@@ -54,23 +55,87 @@ type Producer interface {
 type ChunkRequestHandler struct {
 	chunker  Chunker
 	producer Producer
+
+	metrics *Metrics
+	logger  *log.Logger
 }
 
 // NewChunkRequestHandler constructs a handler that enforces chunker limits before invoking the producer.
-func NewChunkRequestHandler(chunker Chunker, producer Producer) *ChunkRequestHandler {
-	return &ChunkRequestHandler{chunker: chunker, producer: producer}
+func NewChunkRequestHandler(chunker Chunker, producer Producer, opts ...HandlerOption) *ChunkRequestHandler {
+	handler := &ChunkRequestHandler{
+		chunker:  chunker,
+		producer: producer,
+		metrics:  NewMetrics(),
+		logger:   log.Default(),
+	}
+
+	for _, opt := range opts {
+		opt(handler)
+	}
+
+	if handler.metrics == nil {
+		handler.metrics = NewMetrics()
+	}
+	if handler.logger == nil {
+		handler.logger = log.Default()
+	}
+
+	return handler
+}
+
+// HandlerOption customizes a ChunkRequestHandler instance.
+type HandlerOption func(*ChunkRequestHandler)
+
+// WithMetrics attaches metrics collectors to the handler.
+func WithMetrics(metrics *Metrics) HandlerOption {
+	return func(handler *ChunkRequestHandler) {
+		handler.metrics = metrics
+	}
+}
+
+// WithLogger overrides the logger used for structured events.
+func WithLogger(logger *log.Logger) HandlerOption {
+	return func(handler *ChunkRequestHandler) {
+		handler.logger = logger
+	}
 }
 
 // ServeHTTP enforces chunker limits and delegates to the producer.
 func (h *ChunkRequestHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.logEvent(map[string]any{
+		"event": "tts_stream_start",
+		"path":  r.URL.Path,
+	})
+
 	release, err := h.chunker.Acquire(r.Context())
 	if err != nil {
-		h.writeChunkerError(w, err)
+		h.writeChunkerError(w, r.URL.Path, err)
 		return
 	}
-	defer release()
+
+	h.metrics.IncActiveStreams()
+
+	status := "ok"
+	var errorMessage string
+	defer func() {
+		release()
+		h.metrics.DecActiveStreams()
+		h.logEvent(map[string]any{
+			"event":  "tts_stream_finish",
+			"path":   r.URL.Path,
+			"status": status,
+			"error":  errorMessage,
+		})
+	}()
 
 	if err := h.producer.Produce(r.Context()); err != nil {
+		status = "error"
+		errorMessage = err.Error()
+		h.logEvent(map[string]any{
+			"event": "tts_stream_error",
+			"path":  r.URL.Path,
+			"error": err.Error(),
+		})
 		h.writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -119,14 +184,22 @@ func (c *SemaphoreChunker) Acquire(ctx context.Context) (func(), error) {
 	}
 }
 
-func (h *ChunkRequestHandler) writeChunkerError(w http.ResponseWriter, err error) {
+func (h *ChunkRequestHandler) writeChunkerError(w http.ResponseWriter, path string, err error) {
 	var chunkErr ChunkerError
 	if errors.As(err, &chunkErr) {
+		h.logEvent(map[string]any{
+			"event":              "tts_stream_error",
+			"path":               path,
+			"chunker_error_code": chunkErr.Code,
+			"error":              chunkErr.Error(),
+		})
 		switch chunkErr.Code {
 		case ChunkerErrorLimitExceeded:
+			h.metrics.IncLimitExceeded()
 			h.writeJSON(w, http.StatusServiceUnavailable, errorPayload(chunkErr.Code, chunkErr.Error()))
 			return
 		case ChunkerErrorTimeout:
+			h.metrics.IncAcquireTimeout()
 			h.writeJSON(w, http.StatusGatewayTimeout, errorPayload(chunkErr.Code, chunkErr.Error()))
 			return
 		}
@@ -152,4 +225,17 @@ func (h *ChunkRequestHandler) writeJSON(w http.ResponseWriter, status int, paylo
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func (h *ChunkRequestHandler) logEvent(fields map[string]any) {
+	if h.logger == nil {
+		return
+	}
+
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		h.logger.Printf("event=serialize_error err=%v", err)
+		return
+	}
+	h.logger.Printf("%s", payload)
 }
