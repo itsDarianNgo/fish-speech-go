@@ -23,7 +23,7 @@ const (
 type ttsRequest struct {
 	Text        string   `json:"text"`
 	ReferenceID string   `json:"reference_id"`
-	Streaming   bool     `json:"streaming"`
+	Streaming   *bool    `json:"streaming"`
 	Format      string   `json:"format"`
 	TopP        *float64 `json:"top_p,omitempty"`
 	Temperature *float64 `json:"temperature,omitempty"`
@@ -46,22 +46,18 @@ func NewTTSHandler(chunker *streaming.Chunker, backend ttsBackend) *TTSHandler {
 
 // ServeHTTP validates the request and proxies it to the backend using the chunker's Stream guard.
 func (h *TTSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		h.writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only POST is supported")
+		return
+	}
+
 	payload, err := h.parseRequest(w, r)
 	if err != nil {
 		return
 	}
 
-	backendReq := backend.TTSRequest{
-		Text:        payload.Text,
-		ReferenceID: payload.ReferenceID,
-		Streaming:   payload.Streaming,
-		Format:      payload.Format,
-		TopP:        payload.TopP,
-		Temperature: payload.Temperature,
-	}
-
 	streamErr := h.chunker.Stream(r.Context(), func(ctx context.Context) error {
-		resp, err := h.backend.StreamTTS(ctx, backendReq)
+		resp, err := h.backend.StreamTTS(ctx, payload)
 		if err != nil {
 			return err
 		}
@@ -82,7 +78,7 @@ func (h *TTSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.handleStreamError(w, streamErr)
 }
 
-func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (ttsRequest, error) {
+func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (backend.TTSRequest, error) {
 	var payload ttsRequest
 
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
@@ -93,26 +89,40 @@ func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (ttsRe
 		var maxErr *http.MaxBytesError
 		if errors.As(err, &maxErr) {
 			h.writeError(w, http.StatusRequestEntityTooLarge, "request_too_large", "request body exceeds limit")
-			return ttsRequest{}, err
+			return backend.TTSRequest{}, err
 		}
 		h.writeError(w, http.StatusBadRequest, "invalid_request", "failed to decode request payload")
-		return ttsRequest{}, err
+		return backend.TTSRequest{}, err
+	}
+
+	if err := decoder.Decode(new(struct{})); err != io.EOF {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "request body must contain a single JSON object")
+		return backend.TTSRequest{}, fmt.Errorf("extra data after JSON payload")
 	}
 
 	if strings.TrimSpace(payload.Text) == "" {
 		h.writeError(w, http.StatusBadRequest, "invalid_request", "text is required")
-		return ttsRequest{}, fmt.Errorf("text missing")
+		return backend.TTSRequest{}, fmt.Errorf("text missing")
 	}
 	payload.Text = strings.TrimSpace(payload.Text)
 	if len(payload.Text) > maxTextLength {
 		h.writeError(w, http.StatusBadRequest, "limit_exceeded", fmt.Sprintf("text exceeds max length of %d", maxTextLength))
-		return ttsRequest{}, fmt.Errorf("text too long")
+		return backend.TTSRequest{}, fmt.Errorf("text too long")
 	}
 
 	payload.ReferenceID = strings.TrimSpace(payload.ReferenceID)
 	if len(payload.ReferenceID) > maxReferenceIDLength {
 		h.writeError(w, http.StatusBadRequest, "limit_exceeded", fmt.Sprintf("reference_id exceeds max length of %d", maxReferenceIDLength))
-		return ttsRequest{}, fmt.Errorf("reference id too long")
+		return backend.TTSRequest{}, fmt.Errorf("reference id too long")
+	}
+
+	if payload.Streaming == nil {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "streaming flag is required")
+		return backend.TTSRequest{}, fmt.Errorf("streaming flag missing")
+	}
+	if !*payload.Streaming {
+		h.writeError(w, http.StatusBadRequest, "invalid_request", "streaming must be enabled")
+		return backend.TTSRequest{}, fmt.Errorf("streaming disabled")
 	}
 
 	if payload.Format == "" {
@@ -120,24 +130,31 @@ func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (ttsRe
 	}
 	if payload.Format != "wav" {
 		h.writeError(w, http.StatusBadRequest, "invalid_request", "unsupported audio format")
-		return ttsRequest{}, fmt.Errorf("unsupported format")
+		return backend.TTSRequest{}, fmt.Errorf("unsupported format")
 	}
 
 	if payload.TopP != nil {
 		if *payload.TopP <= 0 || *payload.TopP > 1 {
 			h.writeError(w, http.StatusBadRequest, "invalid_request", "top_p must be in (0, 1]")
-			return ttsRequest{}, fmt.Errorf("invalid top_p")
+			return backend.TTSRequest{}, fmt.Errorf("invalid top_p")
 		}
 	}
 
 	if payload.Temperature != nil {
 		if *payload.Temperature < 0 || *payload.Temperature > 2 {
 			h.writeError(w, http.StatusBadRequest, "invalid_request", "temperature must be between 0 and 2")
-			return ttsRequest{}, fmt.Errorf("invalid temperature")
+			return backend.TTSRequest{}, fmt.Errorf("invalid temperature")
 		}
 	}
 
-	return payload, nil
+	return backend.TTSRequest{
+		Text:        payload.Text,
+		ReferenceID: payload.ReferenceID,
+		Streaming:   *payload.Streaming,
+		Format:      payload.Format,
+		TopP:        payload.TopP,
+		Temperature: payload.Temperature,
+	}, nil
 }
 
 func (h *TTSHandler) handleStreamError(w http.ResponseWriter, err error) {
