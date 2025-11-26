@@ -53,6 +53,63 @@ func TestTTSHandlerValidatesRequest(t *testing.T) {
 	}
 }
 
+func TestTTSHandlerStreamingFlag(t *testing.T) {
+	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1}), &stubBackend{})
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	testCases := []struct {
+		name     string
+		body     string
+		expCode  int
+		expError string
+	}{
+		{
+			name:     "missing streaming",
+			body:     `{"text":"hello","format":"wav"}`,
+			expCode:  http.StatusBadRequest,
+			expError: "streaming flag is required",
+		},
+		{
+			name:     "disabled streaming",
+			body:     `{"text":"hello","format":"wav","streaming":false}`,
+			expCode:  http.StatusBadRequest,
+			expError: "streaming must be enabled",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(tc.body))
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != tc.expCode {
+				t.Fatalf("expected status %d, got %d", tc.expCode, resp.StatusCode)
+			}
+
+			var payload struct {
+				Error struct {
+					Code    string `json:"code"`
+					Message string `json:"message"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+				t.Fatalf("failed to decode error payload: %v", err)
+			}
+
+			if payload.Error.Code != "invalid_request" {
+				t.Fatalf("unexpected error code: %s", payload.Error.Code)
+			}
+			if payload.Error.Message != tc.expError {
+				t.Fatalf("unexpected error message: %s", payload.Error.Message)
+			}
+		})
+	}
+}
+
 func TestTTSHandlerStreamsSuccess(t *testing.T) {
 	backendCalled := make(chan backend.TTSRequest, 1)
 	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 2}), &stubBackend{
@@ -125,7 +182,7 @@ func TestTTSHandlerAcquireTimeout(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"first","format":"wav"}`))
+		resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"first","format":"wav","streaming":true}`))
 		if err != nil {
 			t.Errorf("first request failed: %v", err)
 			return
@@ -136,7 +193,7 @@ func TestTTSHandlerAcquireTimeout(t *testing.T) {
 
 	<-started
 
-	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"second","format":"wav"}`))
+	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"second","format":"wav","streaming":true}`))
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
