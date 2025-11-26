@@ -15,12 +15,14 @@ var (
 type Chunker struct {
 	slots          chan struct{}
 	acquireTimeout time.Duration
+	metrics        *Metrics
 }
 
 // ChunkerConfig controls how the Chunker gates concurrent access.
 type ChunkerConfig struct {
 	MaxConcurrent  int
 	AcquireTimeout time.Duration
+	Metrics        *Metrics
 }
 
 // NewChunker constructs a Chunker with the provided configuration.
@@ -31,6 +33,7 @@ func NewChunker(cfg ChunkerConfig) *Chunker {
 	return &Chunker{
 		slots:          make(chan struct{}, cfg.MaxConcurrent),
 		acquireTimeout: cfg.AcquireTimeout,
+		metrics:        cfg.Metrics,
 	}
 }
 
@@ -39,7 +42,7 @@ func (c *Chunker) Acquire(ctx context.Context) (func(), error) {
 	// Fast path when a slot is immediately available.
 	select {
 	case c.slots <- struct{}{}:
-		return c.releaseFn(), nil
+		return c.onAcquire(), nil
 	default:
 	}
 
@@ -47,7 +50,7 @@ func (c *Chunker) Acquire(ctx context.Context) (func(), error) {
 	if c.acquireTimeout <= 0 {
 		select {
 		case c.slots <- struct{}{}:
-			return c.releaseFn(), nil
+			return c.onAcquire(), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
@@ -58,19 +61,30 @@ func (c *Chunker) Acquire(ctx context.Context) (func(), error) {
 
 	select {
 	case c.slots <- struct{}{}:
-		return c.releaseFn(), nil
+		return c.onAcquire(), nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case <-timer.C:
+		if c.metrics != nil {
+			c.metrics.IncAcquireTimeouts()
+		}
 		return nil, ErrAcquireTimeout
 	}
 }
 
-func (c *Chunker) releaseFn() func() {
+func (c *Chunker) onAcquire() func() {
+	if c.metrics != nil {
+		c.metrics.IncActiveStreams()
+	}
+
 	return func() {
 		select {
 		case <-c.slots:
 		default:
+		}
+
+		if c.metrics != nil {
+			c.metrics.DecActiveStreams()
 		}
 	}
 }

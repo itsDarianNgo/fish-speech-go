@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,7 +39,9 @@ func (p *blockingProducer) Produce(_ context.Context) error {
 func TestChunkHandlerRespectsMaxConcurrent(t *testing.T) {
 	chunker := NewSemaphoreChunker(2, 0)
 	producer := newBlockingProducer(3)
-	handler := NewChunkRequestHandler(chunker, producer)
+	metrics := NewMetrics()
+	logBuf := &bytes.Buffer{}
+	handler := NewChunkRequestHandler(chunker, producer, WithMetrics(metrics), WithLogger(log.New(logBuf, "", 0)))
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -53,12 +57,20 @@ func TestChunkHandlerRespectsMaxConcurrent(t *testing.T) {
 
 	waitForStarts(t, producer, 2)
 
+	if metrics.ActiveStreams() != 2 {
+		t.Fatalf("expected active streams to reflect two in-flight requests, got %d", metrics.ActiveStreams())
+	}
+
 	// Third request should immediately receive limit exceeded.
 	resp3Ch := startRequest()
 	resp3 := waitForResponse(t, resp3Ch)
 	defer resp3.Body.Close()
 
 	assertErrorResponse(t, resp3, http.StatusServiceUnavailable, ChunkerErrorLimitExceeded)
+
+	if metrics.LimitExceededResponses() != 1 {
+		t.Fatalf("expected limit exceeded counter to be 1, got %d", metrics.LimitExceededResponses())
+	}
 
 	// Unblock the first two requests and assert they complete.
 	close(producer.release)
@@ -76,12 +88,21 @@ func TestChunkHandlerRespectsMaxConcurrent(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	if metrics.ActiveStreams() != 0 {
+		t.Fatalf("expected active streams to return to zero, got %d", metrics.ActiveStreams())
+	}
+
+	if !strings.Contains(logBuf.String(), `"chunker_error_code":"limit_exceeded"`) {
+		t.Fatalf("expected structured log to include chunker error code, got: %s", logBuf.String())
+	}
 }
 
 func TestChunkHandlerRespectsAcquireTimeout(t *testing.T) {
 	chunker := NewSemaphoreChunker(1, 50*time.Millisecond)
 	producer := newBlockingProducer(2)
-	handler := NewChunkRequestHandler(chunker, producer)
+	metrics := NewMetrics()
+	handler := NewChunkRequestHandler(chunker, producer, WithMetrics(metrics))
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -96,6 +117,10 @@ func TestChunkHandlerRespectsAcquireTimeout(t *testing.T) {
 	defer resp2.Body.Close()
 
 	assertErrorResponse(t, resp2, http.StatusGatewayTimeout, ChunkerErrorTimeout)
+
+	if metrics.AcquireTimeouts() != 1 {
+		t.Fatalf("expected acquire timeout counter to be 1, got %d", metrics.AcquireTimeouts())
+	}
 
 	close(producer.release)
 
