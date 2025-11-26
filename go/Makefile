@@ -6,57 +6,100 @@ BUILD_DATE ?= $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 LDFLAGS := -ldflags "-X main.Version=$(VERSION) -X main.Commit=$(COMMIT) -X main.BuildDate=$(BUILD_DATE)"
 
-.PHONY: all build build-server build-tts build-ctl test clean install run run-dev docker-build help test-coverage
+.PHONY: all build build-server build-tts build-ctl test clean install docker-build docker-up docker-down docker-logs run run-dev help test-coverage integration-test
 
 all: build
+
+# =============================================================================
+# Build
+# =============================================================================
 
 build: build-server build-tts build-ctl
 
 build-server:
-go build $(LDFLAGS) -o bin/fish-server ./cmd/fish-server
+	go build $(LDFLAGS) -o bin/fish-server ./cmd/fish-server
 
 build-tts:
-go build $(LDFLAGS) -o bin/fish-tts ./cmd/fish-tts
+	go build $(LDFLAGS) -o bin/fish-tts ./cmd/fish-tts
 
 build-ctl:
-go build $(LDFLAGS) -o bin/fish-ctl ./cmd/fish-ctl
+	go build $(LDFLAGS) -o bin/fish-ctl ./cmd/fish-ctl
+
+# =============================================================================
+# Test
+# =============================================================================
 
 test:
-go test -v ./...
+	go test -v ./...
 
 test-coverage:
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out -o coverage.html
+	go test -coverprofile=coverage.out ./...
+	go tool cover -html=coverage.out -o coverage.html
 
-clean:
-rm -rf bin/
-rm -f coverage.out coverage.html
+integration-test:
+	cd ../scripts && ./run-integration-tests.sh
 
-install: build
-cp bin/fish-server $(GOPATH)/bin/
-cp bin/fish-tts $(GOPATH)/bin/
-cp bin/fish-ctl $(GOPATH)/bin/
+# =============================================================================
+# Docker
+# =============================================================================
 
-# Development helpers
+docker-build:
+	cd ../docker && docker compose build
+
+docker-up:
+	cd ../docker && docker compose up -d
+
+docker-down:
+	cd ../docker && docker compose down
+
+docker-logs:
+	cd ../docker && docker compose logs -f
+
+# =============================================================================
+# Development
+# =============================================================================
+
 run:
-go run ./cmd/fish-server
+	go run ./cmd/fish-server
 
 run-dev:
-go run ./cmd/fish-server --log-format text --log-level debug
+	go run ./cmd/fish-server --log-format text --log-level debug
 
-# Docker targets (for Phase 6)
-docker-build:
-docker build -f ../docker/Dockerfile.server -t fish-speech-go-server ..
+clean:
+	rm -rf bin/
+	rm -f coverage.out coverage.html
 
+install: build
+	cp bin/fish-server $(GOPATH)/bin/
+	cp bin/fish-tts $(GOPATH)/bin/
+	cp bin/fish-ctl $(GOPATH)/bin/
+
+# =============================================================================
 # Help
+# =============================================================================
+
 help:
-@echo "Available targets:"
-@echo "  build        - Build all binaries"
-@echo "  build-server - Build fish-server only"
-@echo "  build-tts    - Build fish-tts only"
-@echo "  build-ctl    - Build fish-ctl only"
-@echo "  test         - Run tests"
-@echo "  clean        - Remove build artifacts"
-@echo "  install      - Install binaries to GOPATH/bin"
-@echo "  run          - Run server with default settings"
-@echo "  run-dev      - Run server with dev settings (text logs, debug level)"
+	@echo "Fish-Speech-Go Build System"
+	@echo ""
+	@echo "Build targets:"
+	@echo "  build            Build all binaries"
+	@echo "  build-server     Build fish-server"
+	@echo "  build-tts        Build fish-tts"
+	@echo "  build-ctl        Build fish-ctl"
+	@echo ""
+	@echo "Test targets:"
+	@echo "  test             Run unit tests"
+	@echo "  test-coverage    Run tests with coverage"
+	@echo "  integration-test Run integration tests (requires Docker)"
+	@echo ""
+	@echo "Docker targets:"
+	@echo "  docker-build     Build Docker images"
+	@echo "  docker-up        Start Docker services"
+	@echo "  docker-down      Stop Docker services"
+	@echo "  docker-logs      View Docker logs"
+	@echo ""
+	@echo "Development:"
+	@echo "  run              Run server with defaults"
+	@echo "  run-dev          Run server with debug logging"
+	@echo "  clean            Remove build artifacts"
+	@echo "  install          Install binaries to GOPATH"

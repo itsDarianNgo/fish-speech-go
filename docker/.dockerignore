@@ -1,0 +1,23 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.idea
+.vscode
+*.swp
+
+# Build artifacts
+go/bin/
+*.exe
+
+# Test artifacts
+coverage.out
+coverage.html
+
+# Docs (not needed in container)
+docs/
+
+# Local configs
+*.local.yaml
+.env
