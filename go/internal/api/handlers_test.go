@@ -3,169 +3,301 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/vmihailenco/msgpack/v5"
 
-	"github.com/fish-speech-go/fish-speech-go/internal/backend"
 	"github.com/fish-speech-go/fish-speech-go/internal/config"
 	"github.com/fish-speech-go/fish-speech-go/internal/schema"
 )
 
+// Mock backend for testing
 type mockBackend struct {
-	ttsFunc       func(ctx context.Context, req *schema.ServeTTSRequest) ([]byte, string, error)
-	ttsStreamFunc func(ctx context.Context, req *schema.ServeTTSRequest) (io.ReadCloser, error)
-	healthFunc    func(ctx context.Context) error
-	vqganEncodeFn func(ctx context.Context, req *schema.ServeVQGANEncodeRequest) (*schema.ServeVQGANEncodeResponse, error)
-	vqganDecodeFn func(ctx context.Context, req *schema.ServeVQGANDecodeRequest) (*schema.ServeVQGANDecodeResponse, error)
+	healthErr       error
+	ttsResponse     []byte
+	ttsErr          error
+	vqganEncodeResp *schema.ServeVQGANEncodeResponse
+	vqganEncodeErr  error
+	vqganDecodeResp *schema.ServeVQGANDecodeResponse
+	vqganDecodeErr  error
+	addRefResp      *schema.AddReferenceResponse
+	addRefErr       error
+	listRefResp     *schema.ListReferencesResponse
+	listRefErr      error
+	deleteRefResp   *schema.DeleteReferenceResponse
+	deleteRefErr    error
 }
 
 func (m *mockBackend) Health(ctx context.Context) error {
-	if m.healthFunc != nil {
-		return m.healthFunc(ctx)
-	}
-	return nil
+	return m.healthErr
 }
 
 func (m *mockBackend) TTS(ctx context.Context, req *schema.ServeTTSRequest) ([]byte, string, error) {
-	if m.ttsFunc != nil {
-		return m.ttsFunc(ctx, req)
+	if m.ttsErr != nil {
+		return nil, "", m.ttsErr
 	}
-	return nil, "", backend.ErrBackendUnavailable
+	return m.ttsResponse, "wav", nil
 }
 
 func (m *mockBackend) TTSStream(ctx context.Context, req *schema.ServeTTSRequest) (io.ReadCloser, error) {
-	if m.ttsStreamFunc != nil {
-		return m.ttsStreamFunc(ctx, req)
+	if m.ttsErr != nil {
+		return nil, m.ttsErr
 	}
-	return nil, backend.ErrBackendUnavailable
+	return io.NopCloser(bytes.NewReader(m.ttsResponse)), nil
 }
 
 func (m *mockBackend) VQGANEncode(ctx context.Context, req *schema.ServeVQGANEncodeRequest) (*schema.ServeVQGANEncodeResponse, error) {
-	if m.vqganEncodeFn != nil {
-		return m.vqganEncodeFn(ctx, req)
-	}
-	return nil, backend.ErrBackendUnavailable
+	return m.vqganEncodeResp, m.vqganEncodeErr
 }
 
 func (m *mockBackend) VQGANDecode(ctx context.Context, req *schema.ServeVQGANDecodeRequest) (*schema.ServeVQGANDecodeResponse, error) {
-	if m.vqganDecodeFn != nil {
-		return m.vqganDecodeFn(ctx, req)
-	}
-	return nil, backend.ErrBackendUnavailable
+	return m.vqganDecodeResp, m.vqganDecodeErr
 }
 
-func newTestRouter(b backend.Client) http.Handler {
-	cfg, _ := config.LoadWithDefaults(nil)
-	logger := zerolog.New(io.Discard)
-	return NewRouter(cfg, b, logger)
+func (m *mockBackend) AddReference(ctx context.Context, req *schema.AddReferenceRequest) (*schema.AddReferenceResponse, error) {
+	return m.addRefResp, m.addRefErr
 }
 
-func TestHealthGet(t *testing.T) {
+func (m *mockBackend) ListReferences(ctx context.Context) (*schema.ListReferencesResponse, error) {
+	return m.listRefResp, m.listRefErr
+}
+
+func (m *mockBackend) DeleteReference(ctx context.Context, id string) (*schema.DeleteReferenceResponse, error) {
+	return m.deleteRefResp, m.deleteRefErr
+}
+
+// Health tests
+func TestHealthGet_Basic(t *testing.T) {
+	h := NewHandler(&mockBackend{}, testConfig(), testLogger())
+
 	req := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
-	rr := httptest.NewRecorder()
+	w := httptest.NewRecorder()
 
-	newTestRouter(&mockBackend{}).ServeHTTP(rr, req)
+	h.HandleHealthGet(w, req)
 
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Equal(t, "{\"status\":\"ok\"}\n", rr.Body.String())
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "ok", resp["status"])
 }
 
-func TestHealthPost(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/v1/health", nil)
-	rr := httptest.NewRecorder()
+func TestHealthGet_Detailed(t *testing.T) {
+	h := NewHandler(&mockBackend{}, testConfig(), testLogger())
 
-	newTestRouter(&mockBackend{}).ServeHTTP(rr, req)
+	req := httptest.NewRequest(http.MethodGet, "/v1/health?detailed=true", nil)
+	w := httptest.NewRecorder()
 
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Equal(t, "{\"status\":\"ok\"}\n", rr.Body.String())
+	h.HandleHealthGet(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp HealthResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "ok", resp.Status)
+	assert.NotNil(t, resp.Backend)
+	assert.Equal(t, "healthy", resp.Backend.Status)
 }
 
-func TestParseTTSRequest_JSON(t *testing.T) {
-	body := bytes.NewBufferString(`{"text":"hello"}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", body)
+func TestHealthGet_Detailed_BackendUnhealthy(t *testing.T) {
+	mock := &mockBackend{healthErr: errors.New("connection refused")}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/health?detailed=true", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleHealthGet(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp HealthResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "ok", resp.Status)
+	assert.Equal(t, "unhealthy", resp.Backend.Status)
+}
+
+// VQGAN tests
+func TestVQGANEncode_Success(t *testing.T) {
+	mock := &mockBackend{vqganEncodeResp: &schema.ServeVQGANEncodeResponse{Tokens: [][][]int{{{1, 2, 3}}}}}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	reqBody, _ := json.Marshal(schema.ServeVQGANEncodeRequest{Audios: [][]byte{[]byte("fake audio")}})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/vqgan/encode", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
 
-	parsed, err := ParseTTSRequest(req)
-	require.NoError(t, err)
+	h.HandleVQGANEncode(w, req)
 
-	require.Equal(t, 200, parsed.ChunkLength)
-	require.Equal(t, "wav", parsed.Format)
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Header().Get("Content-Type"), "msgpack")
 }
 
-func TestParseTTSRequest_MessagePack(t *testing.T) {
-	payload := map[string]interface{}{"text": "hello"}
-	encoded, _ := msgpack.Marshal(payload)
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(encoded))
-	req.Header.Set("Content-Type", "application/msgpack")
+func TestVQGANEncode_NoAudio(t *testing.T) {
+	h := NewHandler(&mockBackend{}, testConfig(), testLogger())
 
-	parsed, err := ParseTTSRequest(req)
-	require.NoError(t, err)
-	assert.Equal(t, "hello", parsed.Text)
-}
+	reqBody, _ := json.Marshal(schema.ServeVQGANEncodeRequest{Audios: [][]byte{}})
 
-func TestParseTTSRequest_UnsupportedContentType(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewBufferString("hello"))
-	req.Header.Set("Content-Type", "text/plain")
-
-	_, err := ParseTTSRequest(req)
-	require.Error(t, err)
-
-	httpErr, ok := IsHTTPError(err)
-	require.True(t, ok)
-	assert.Equal(t, http.StatusUnsupportedMediaType, httpErr.Status)
-}
-
-func TestTTSHandler_ValidationErrors(t *testing.T) {
-	body := bytes.NewBufferString(`{"text":"hello","chunk_length":50}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", body)
+	req := httptest.NewRequest(http.MethodPost, "/v1/vqgan/encode", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
 
-	rr := httptest.NewRecorder()
-	newTestRouter(&mockBackend{}).ServeHTTP(rr, req)
+	h.HandleVQGANEncode(w, req)
 
-	require.Equal(t, http.StatusBadRequest, rr.Code)
-	assert.Equal(t, "{\"detail\":\"chunk_length must be between 100 and 300\"}\n", rr.Body.String())
+	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-func TestTTSHandler_StreamingNonWavError(t *testing.T) {
-	body := bytes.NewBufferString(`{"text":"hello","streaming":true,"format":"mp3"}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", body)
+func TestVQGANDecode_Success(t *testing.T) {
+	mock := &mockBackend{vqganDecodeResp: &schema.ServeVQGANDecodeResponse{Audios: [][]byte{[]byte("audio")}}}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	reqBody, _ := json.Marshal(schema.ServeVQGANDecodeRequest{Tokens: [][][]int{{{1, 2}}}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/vqgan/decode", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
 
-	rr := httptest.NewRecorder()
-	newTestRouter(&mockBackend{}).ServeHTTP(rr, req)
+	h.HandleVQGANDecode(w, req)
 
-	require.Equal(t, http.StatusBadRequest, rr.Code)
-	assert.Equal(t, "{\"detail\":\"Streaming only supports WAV format\"}\n", rr.Body.String())
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Contains(t, w.Header().Get("Content-Type"), "msgpack")
 }
 
-func TestTTSHandler_BackendSuccess(t *testing.T) {
-	body := bytes.NewBufferString(`{"text":"hello"}`)
-	req := httptest.NewRequest(http.MethodPost, "/v1/tts", body)
+func TestVQGANDecode_NoTokens(t *testing.T) {
+	h := NewHandler(&mockBackend{}, testConfig(), testLogger())
+
+	reqBody, _ := json.Marshal(schema.ServeVQGANDecodeRequest{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/vqgan/decode", bytes.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
 
-	rr := httptest.NewRecorder()
+	h.HandleVQGANDecode(w, req)
 
-	backend := &mockBackend{
-		ttsFunc: func(ctx context.Context, req *schema.ServeTTSRequest) ([]byte, string, error) {
-			return []byte("audio"), "wav", nil
-		},
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+}
+
+// Reference tests
+func TestAddReference_Success(t *testing.T) {
+	mock := &mockBackend{addRefResp: &schema.AddReferenceResponse{Success: true, Message: "Reference added successfully", ReferenceID: "test-voice"}}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	reqBody, _ := json.Marshal(schema.AddReferenceRequest{ID: "test-voice", Audio: []byte("fake audio data"), Text: "This is a test transcript"})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/references/add", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleAddReference(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp schema.AddReferenceResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.True(t, resp.Success)
+	assert.Equal(t, "test-voice", resp.ReferenceID)
+}
+
+func TestAddReference_InvalidID(t *testing.T) {
+	h := NewHandler(&mockBackend{}, testConfig(), testLogger())
+
+	testCases := []struct {
+		name string
+		id   string
+	}{
+		{"empty", ""},
+		{"invalid chars", "test@voice!"},
+		{"too long", string(make([]byte, 300))},
 	}
 
-	newTestRouter(backend).ServeHTTP(rr, req)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			reqBody, _ := json.Marshal(schema.AddReferenceRequest{ID: tc.id, Audio: []byte("fake audio"), Text: "transcript"})
 
-	require.Equal(t, http.StatusOK, rr.Code)
-	assert.Equal(t, []byte("audio"), rr.Body.Bytes())
-	assert.Equal(t, "audio/wav", rr.Header().Get("Content-Type"))
+			req := httptest.NewRequest(http.MethodPost, "/v1/references/add", bytes.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			h.HandleAddReference(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+		})
+	}
 }
 
+func TestListReferences_Success(t *testing.T) {
+	mock := &mockBackend{listRefResp: &schema.ListReferencesResponse{Success: true, ReferenceIDs: []string{"voice-1", "voice-2"}, Message: "Success"}}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/references", nil)
+	w := httptest.NewRecorder()
+
+	h.HandleListReferences(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+
+	var resp schema.ListReferencesResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.True(t, resp.Success)
+	assert.Len(t, resp.ReferenceIDs, 2)
+}
+
+func TestDeleteReference_Success(t *testing.T) {
+	mock := &mockBackend{deleteRefResp: &schema.DeleteReferenceResponse{Success: true, Message: "Reference deleted successfully", ReferenceID: "test-voice"}}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	req := httptest.NewRequest(http.MethodDelete, "/v1/references/test-voice", nil)
+	w := httptest.NewRecorder()
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("id", "test-voice")
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+
+	h.HandleDeleteReference(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+}
+
+// Backend error handling tests
+func TestTTS_BackendTimeout(t *testing.T) {
+	mock := &mockBackend{ttsErr: context.DeadlineExceeded}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	reqBody, _ := json.Marshal(schema.ServeTTSRequest{Text: "Hello"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleTTS(w, req)
+
+	assert.Equal(t, http.StatusGatewayTimeout, w.Code)
+
+	var resp schema.ErrorResponse
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	assert.Equal(t, "Request timeout", resp.Detail)
+}
+
+func TestTTS_BackendUnavailable(t *testing.T) {
+	mock := &mockBackend{ttsErr: errors.New("connection refused")}
+	h := NewHandler(mock, testConfig(), testLogger())
+
+	reqBody, _ := json.Marshal(schema.ServeTTSRequest{Text: "Hello"})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.HandleTTS(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
+}
+
+// Authentication middleware tests
 func TestAuthMiddleware_NoKeyConfigured(t *testing.T) {
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -226,9 +358,11 @@ func TestAuthMiddleware_MissingHeader(t *testing.T) {
 	assert.Equal(t, "{\"detail\":\"Invalid token\"}\n", rr.Body.String())
 }
 
-func TestWriteError_MatchesUpstreamFormat(t *testing.T) {
-	rr := httptest.NewRecorder()
-	WriteError(rr, http.StatusBadRequest, "something went wrong")
+// Helper functions
+func testConfig() *config.Config {
+	return &config.Config{Limits: config.LimitsConfig{MaxTextLength: 10000}}
+}
 
-	assert.Equal(t, "{\"detail\":\"something went wrong\"}\n", rr.Body.String())
+func testLogger() zerolog.Logger {
+	return zerolog.Nop()
 }

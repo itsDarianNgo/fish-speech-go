@@ -2,6 +2,7 @@ package backend
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -108,4 +109,49 @@ func TestHealth_Failure(t *testing.T) {
 
 	err := client.Health(context.Background())
 	require.Error(t, err)
+}
+
+func TestAddReference_SuccessJSON(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/references/add", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(schema.AddReferenceResponse{Success: true, ReferenceID: "id1"})
+	}))
+	defer mockServer.Close()
+
+	client := NewBackendClient(&config.BackendConfig{URL: mockServer.URL, Timeout: 5 * time.Second})
+
+	resp, err := client.AddReference(context.Background(), &schema.AddReferenceRequest{ID: "id1", Audio: []byte{1}, Text: "t"})
+	require.NoError(t, err)
+	assert.True(t, resp.Success)
+	assert.Equal(t, "id1", resp.ReferenceID)
+}
+
+func TestListReferences_Success(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/v1/references", r.URL.Path)
+		_ = json.NewEncoder(w).Encode(schema.ListReferencesResponse{Success: true, ReferenceIDs: []string{"a", "b"}})
+	}))
+	defer mockServer.Close()
+
+	client := NewBackendClient(&config.BackendConfig{URL: mockServer.URL, Timeout: 5 * time.Second})
+
+	resp, err := client.ListReferences(context.Background())
+	require.NoError(t, err)
+	require.Len(t, resp.ReferenceIDs, 2)
+}
+
+func TestDeleteReference_Success(t *testing.T) {
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodDelete, r.Method)
+		assert.Equal(t, "/v1/references/test", r.URL.Path)
+		_ = json.NewEncoder(w).Encode(schema.DeleteReferenceResponse{Success: true, ReferenceID: "test"})
+	}))
+	defer mockServer.Close()
+
+	client := NewBackendClient(&config.BackendConfig{URL: mockServer.URL, Timeout: 5 * time.Second})
+
+	resp, err := client.DeleteReference(context.Background(), "test")
+	require.NoError(t, err)
+	assert.Equal(t, "test", resp.ReferenceID)
 }

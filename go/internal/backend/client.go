@@ -3,23 +3,17 @@ package backend
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/fish-speech-go/fish-speech-go/internal/config"
 	"github.com/fish-speech-go/fish-speech-go/internal/schema"
 )
-
-// Client describes backend interactions; implemented by BackendClient.
-type Client interface {
-	Health(ctx context.Context) error
-	TTS(ctx context.Context, req *schema.ServeTTSRequest) ([]byte, string, error)
-	TTSStream(ctx context.Context, req *schema.ServeTTSRequest) (io.ReadCloser, error)
-	VQGANEncode(ctx context.Context, req *schema.ServeVQGANEncodeRequest) (*schema.ServeVQGANEncodeResponse, error)
-	VQGANDecode(ctx context.Context, req *schema.ServeVQGANDecodeRequest) (*schema.ServeVQGANDecodeResponse, error)
-}
 
 // BackendClient handles communication with the Python Fish-Speech server.
 type BackendClient struct {
@@ -205,6 +199,101 @@ func (c *BackendClient) VQGANDecode(ctx context.Context, req *schema.ServeVQGAND
 
 	var result schema.ServeVQGANDecodeResponse
 	if err := DecodeMsgpack(respBody, &result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// AddReference adds a new voice reference.
+func (c *BackendClient) AddReference(ctx context.Context, req *schema.AddReferenceRequest) (*schema.AddReferenceResponse, error) {
+	body, err := EncodeMsgpack(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encode request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint+"/v1/references/add", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/msgpack")
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, &BackendError{StatusCode: resp.StatusCode, Message: string(bodyBytes)}
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var result schema.AddReferenceResponse
+	if strings.Contains(resp.Header.Get("Content-Type"), "msgpack") {
+		if err := DecodeMsgpack(respBody, &result); err != nil {
+			return nil, err
+		}
+	} else {
+		if err := json.Unmarshal(respBody, &result); err != nil {
+			return nil, err
+		}
+	}
+
+	return &result, nil
+}
+
+// ListReferences returns all saved voice references.
+func (c *BackendClient) ListReferences(ctx context.Context) (*schema.ListReferencesResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint+"/v1/references", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, &BackendError{StatusCode: resp.StatusCode, Message: string(bodyBytes)}
+	}
+
+	var result schema.ListReferencesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return &result, nil
+}
+
+// DeleteReference removes a voice reference by ID.
+func (c *BackendClient) DeleteReference(ctx context.Context, id string) (*schema.DeleteReferenceResponse, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.endpoint+"/v1/references/"+url.PathEscape(id), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		return nil, &BackendError{StatusCode: resp.StatusCode, Message: string(bodyBytes)}
+	}
+
+	var result schema.DeleteReferenceResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 

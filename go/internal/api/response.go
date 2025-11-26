@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/vmihailenco/msgpack/v5"
+
 	"github.com/fish-speech-go/fish-speech-go/internal/schema"
 )
 
@@ -20,6 +22,22 @@ func WriteJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+// WriteMsgpack writes a MessagePack response.
+func WriteMsgpack(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/msgpack")
+	w.WriteHeader(status)
+
+	encoded, err := msgpack.Marshal(data)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(schema.ErrorResponse{Detail: "Failed to encode response"})
+		return
+	}
+
+	_, _ = w.Write(encoded)
 }
 
 // WriteAudio writes binary audio data with the appropriate content type.

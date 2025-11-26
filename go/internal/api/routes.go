@@ -9,13 +9,15 @@ import (
 )
 
 // NewRouter constructs the HTTP router with middleware and routes.
-func NewRouter(cfg *config.Config, backendClient backend.Client, logger zerolog.Logger) chi.Router {
+func NewRouter(cfg *config.Config, backendClient backend.Backend, logger zerolog.Logger) chi.Router {
 	r := chi.NewRouter()
 
 	r.Use(RequestIDMiddleware)
 	r.Use(LoggingMiddleware(logger))
 	r.Use(CORSMiddleware)
-	r.Use(AuthMiddleware(cfg.Auth.APIKey))
+	if cfg.Auth.APIKey != "" {
+		r.Use(AuthMiddleware(cfg.Auth.APIKey))
+	}
 
 	h := NewHandler(backendClient, cfg, logger)
 
