@@ -9,6 +9,8 @@ import (
 var (
 	// ErrAcquireTimeout indicates the chunker could not provide a slot within the configured timeout.
 	ErrAcquireTimeout = errors.New("chunker: acquire timeout")
+	// ErrLimitExceeded indicates the chunker refused a slot because concurrency is exhausted.
+	ErrLimitExceeded = errors.New("chunker: limit exceeded")
 )
 
 // Chunker limits concurrent streaming operations using a semaphore-style slot pool.
@@ -53,6 +55,11 @@ func (c *Chunker) Acquire(ctx context.Context) (func(), error) {
 			return c.onAcquire(), nil
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		default:
+			if c.metrics != nil {
+				c.metrics.IncLimitExceeded()
+			}
+			return nil, ErrLimitExceeded
 		}
 	}
 
