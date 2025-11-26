@@ -2,91 +2,44 @@ package streaming
 
 import (
 	"context"
-	"runtime"
-	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func BenchmarkChunkerAcquire(b *testing.B) {
-	cases := []struct {
-		name           string
-		maxConcurrent  int
-		acquireTimeout time.Duration
-		parallelism    int
-	}{
-		{name: "max1-timeout1ms", maxConcurrent: 1, acquireTimeout: time.Millisecond, parallelism: 4},
-		{name: "max4-timeout1ms", maxConcurrent: 4, acquireTimeout: time.Millisecond, parallelism: 4},
-		{name: "max16-timeout5ms", maxConcurrent: 16, acquireTimeout: 5 * time.Millisecond, parallelism: 8},
-		{name: "max32-no-timeout", maxConcurrent: 32, acquireTimeout: 0, parallelism: 8},
+func BenchmarkChunkerAcquireRelease(b *testing.B) {
+	chunker, err := NewChunker(Options{MaxConcurrent: 32, AcquireTimeout: time.Second})
+	if err != nil {
+		b.Fatalf("failed to create chunker: %v", err)
 	}
 
-	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			chunker := NewChunker(ChunkerConfig{MaxConcurrent: tc.maxConcurrent, AcquireTimeout: tc.acquireTimeout})
-			b.ReportAllocs()
-			if tc.parallelism > 0 {
-				b.SetParallelism(tc.parallelism)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		ctx := context.Background()
+		for pb.Next() {
+			release, err := chunker.Acquire(ctx)
+			if err != nil {
+				b.Fatalf("unexpected acquire error: %v", err)
 			}
-			b.ResetTimer()
-
-			ctx := context.Background()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					release, err := chunker.Acquire(ctx)
-					if err != nil {
-						b.Fatalf("unexpected acquire error: %v", err)
-					}
-					release()
-				}
-			})
-		})
-	}
+			release()
+		}
+	})
 }
 
-func BenchmarkChunkerStreamContention(b *testing.B) {
-	cases := []struct {
-		name           string
-		maxConcurrent  int
-		workers        int
-		acquireTimeout time.Duration
-		holdOps        int
-	}{
-		{name: "2slots-8workers-short-timeout", maxConcurrent: 2, workers: 8, acquireTimeout: 500 * time.Microsecond, holdOps: 64},
-		{name: "4slots-16workers-short-timeout", maxConcurrent: 4, workers: 16, acquireTimeout: time.Millisecond, holdOps: 64},
-		{name: "8slots-32workers-no-timeout", maxConcurrent: 8, workers: 32, acquireTimeout: 0, holdOps: 32},
+func BenchmarkChunkerContention(b *testing.B) {
+	chunker, err := NewChunker(Options{MaxConcurrent: 8, AcquireTimeout: time.Second})
+	if err != nil {
+		b.Fatalf("failed to create chunker: %v", err)
 	}
 
-	for _, tc := range cases {
-		b.Run(tc.name, func(b *testing.B) {
-			chunker := NewChunker(ChunkerConfig{MaxConcurrent: tc.maxConcurrent, AcquireTimeout: tc.acquireTimeout})
-			var timeouts int64
-
-			ctx := context.Background()
-			b.ReportAllocs()
-			b.ResetTimer()
-
-			b.RunParallel(func(pb *testing.PB) {
-				// RunParallel spawns GOMAXPROCS*parallelism goroutines; give each a small work section.
-				for pb.Next() {
-					release, err := chunker.Acquire(ctx)
-					if err != nil {
-						if err == ErrAcquireTimeout {
-							atomic.AddInt64(&timeouts, 1)
-							continue
-						}
-						b.Fatalf("unexpected acquire error: %v", err)
-					}
-
-					for i := 0; i < tc.holdOps; i++ {
-						runtime.Gosched()
-					}
-					release()
-				}
+	b.ReportAllocs()
+	b.SetParallelism(64)
+	b.RunParallel(func(pb *testing.PB) {
+		ctx := context.Background()
+		for pb.Next() {
+			_ = chunker.Stream(ctx, func(context.Context) error {
+				time.Sleep(100 * time.Microsecond)
+				return nil
 			})
-
-			b.ReportMetric(float64(timeouts), "timeouts")
-			b.ReportMetric(float64(timeouts)/float64(b.N), "timeouts/op")
-		})
-	}
+		}
+	})
 }
