@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"os"
+	"strconv"
 	"time"
 )
 
@@ -10,6 +11,7 @@ type Config struct {
 	Server  ServerConfig
 	Backend BackendConfig
 	Auth    AuthConfig
+	Limits  LimitsConfig
 	Logging LoggingConfig
 }
 
@@ -26,6 +28,10 @@ type BackendConfig struct {
 
 type AuthConfig struct {
 	APIKey string
+}
+
+type LimitsConfig struct {
+	MaxTextLength int
 }
 
 type LoggingConfig struct {
@@ -52,6 +58,9 @@ func LoadWithDefaults(overrides map[string]interface{}) (*Config, error) {
 		},
 		Auth: AuthConfig{
 			APIKey: "",
+		},
+		Limits: LimitsConfig{
+			MaxTextLength: 0,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -104,5 +113,10 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("FISH_LOG_FORMAT"); v != "" {
 		cfg.Logging.Format = v
+	}
+	if v := os.Getenv("FISH_MAX_TEXT_LENGTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.Limits.MaxTextLength = n
+		}
 	}
 }
