@@ -1,0 +1,30 @@
+# Fish-Speech-Go Configuration
+#
+# This file shows all available configuration options.
+# Values shown are the defaults.
+#
+# Configuration priority (highest to lowest):
+# 1. CLI flags (--listen, --backend, etc.)
+# 2. Environment variables (FISH_LISTEN, FISH_BACKEND, etc.)
+# 3. This config file
+# 4. Built-in defaults
+
+server:
+  listen: "0.0.0.0:8080"
+  read_timeout: 30s
+  write_timeout: 120s
+
+backend:
+  url: "http://127.0.0.1:8081"
+  timeout: 60s
+  max_connections: 100
+
+auth:
+  api_key: ""
+
+limits:
+  max_text_length: 0
+
+logging:
+  level: "info"
+  format: "json"
