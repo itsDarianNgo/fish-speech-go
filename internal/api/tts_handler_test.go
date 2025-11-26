@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -217,4 +218,76 @@ func TestTTSHandlerAcquireTimeout(t *testing.T) {
 
 	close(release)
 	wg.Wait()
+}
+
+func TestTTSHandlerLimitExceededLogging(t *testing.T) {
+	chunker := streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1, AcquireTimeout: 0})
+	release := make(chan struct{})
+	started := make(chan struct{})
+	logBuf := &bytes.Buffer{}
+
+	backendStub := &stubBackend{stream: func(_ context.Context, _ backend.TTSRequest) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			close(started)
+			_, _ = pw.Write([]byte("chunk"))
+			<-release
+			pw.Close()
+		}()
+
+		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
+	}}
+
+	handler := NewTTSHandler(chunker, backendStub)
+	handler.logger = log.New(logBuf, "", 0)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"first","format":"wav"}`))
+		if err != nil {
+			t.Errorf("first request failed: %v", err)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	<-started
+
+	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"second","format":"wav"}`))
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("failed to decode error payload: %v", err)
+	}
+	if payload.Error.Code != "limit_exceeded" {
+		t.Fatalf("unexpected error code: %s", payload.Error.Code)
+	}
+
+	close(release)
+	wg.Wait()
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "\"chunker_error_code\":\"limit_exceeded\"") {
+		t.Fatalf("expected chunker error code in logs, got: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "\"duration_ms\":") {
+		t.Fatalf("expected duration in logs, got: %s", logOutput)
+	}
 }
