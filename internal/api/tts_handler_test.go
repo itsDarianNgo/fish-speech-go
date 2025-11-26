@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"fish-speech-go/internal/backend"
+	"fish-speech-go/internal/queue"
 	"fish-speech-go/internal/streaming"
 )
 
@@ -25,7 +26,7 @@ func (s *stubBackend) StreamTTS(ctx context.Context, req backend.TTSRequest) (*h
 }
 
 func TestTTSHandlerValidatesRequest(t *testing.T) {
-	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 2}), &stubBackend{})
+	handler := NewTTSHandler(streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 2}), &stubBackend{}, queue.NewManager(queue.Config{Workers: 2, MaxQueue: 2}))
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
@@ -64,7 +65,7 @@ func TestTTSHandlerStreamsSuccess(t *testing.T) {
 				Body:       io.NopCloser(strings.NewReader("audio-bytes")),
 			}, nil
 		},
-	})
+	}, queue.NewManager(queue.Config{Workers: 2, MaxQueue: 2}))
 
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
@@ -117,7 +118,7 @@ func TestTTSHandlerAcquireTimeout(t *testing.T) {
 		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
 	}}
 
-	handler := NewTTSHandler(chunker, backendStub)
+	handler := NewTTSHandler(chunker, backendStub, queue.NewManager(queue.Config{Workers: 2, MaxQueue: 1}))
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 
@@ -160,4 +161,124 @@ func TestTTSHandlerAcquireTimeout(t *testing.T) {
 
 	close(release)
 	wg.Wait()
+}
+
+func TestTTSHandlerQueueFull(t *testing.T) {
+	chunker := streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1})
+	queueManager := queue.NewManager(queue.Config{Workers: 1, MaxQueue: 0})
+	backendStart := make(chan struct{})
+	release := make(chan struct{})
+
+	backendStub := &stubBackend{stream: func(_ context.Context, _ backend.TTSRequest) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			close(backendStart)
+			<-release
+			pw.Close()
+		}()
+
+		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
+	}}
+
+	handler := NewTTSHandler(chunker, backendStub, queueManager)
+	server := httptest.NewServer(handler)
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { _ = handler.Shutdown(context.Background()) })
+
+	go func() {
+		reqBody := bytes.NewBufferString(`{"text":"first","format":"wav"}`)
+		resp, err := http.Post(server.URL, "application/json", reqBody)
+		if err != nil {
+			t.Errorf("first request failed: %v", err)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	select {
+	case <-backendStart:
+	case <-time.After(time.Second):
+		t.Fatalf("backend did not start")
+	}
+
+	resp, err := http.Post(server.URL, "application/json", bytes.NewBufferString(`{"text":"second","format":"wav"}`))
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d", resp.StatusCode)
+	}
+
+	var payload struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("failed to decode error payload: %v", err)
+	}
+
+	if payload.Error.Code != "queue_full" {
+		t.Fatalf("unexpected error code: %s", payload.Error.Code)
+	}
+
+	close(release)
+}
+
+func TestTTSHandlerShutdownWaits(t *testing.T) {
+	chunker := streaming.NewChunker(streaming.ChunkerConfig{MaxConcurrent: 1})
+	queueManager := queue.NewManager(queue.Config{Workers: 1, MaxQueue: 1})
+	release := make(chan struct{})
+	backendStarted := make(chan struct{})
+
+	backendStub := &stubBackend{stream: func(_ context.Context, _ backend.TTSRequest) (*http.Response, error) {
+		pr, pw := io.Pipe()
+		go func() {
+			close(backendStarted)
+			<-release
+			pw.Close()
+		}()
+		return &http.Response{StatusCode: http.StatusOK, Body: pr}, nil
+	}}
+
+	handler := NewTTSHandler(chunker, backendStub, queueManager)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/tts", bytes.NewBufferString(`{"text":"hello","format":"wav"}`))
+	recorder := httptest.NewRecorder()
+
+	go handler.ServeHTTP(recorder, req)
+
+	select {
+	case <-backendStarted:
+	case <-time.After(time.Second):
+		t.Fatalf("backend did not start")
+	}
+
+	shutdownErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		shutdownErr <- handler.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-shutdownErr:
+		if err == nil {
+			t.Fatalf("expected shutdown to time out while stream active")
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatalf("shutdown did not return in time")
+	}
+
+	close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := handler.Shutdown(ctx); err != nil {
+		t.Fatalf("shutdown after release failed: %v", err)
+	}
 }
