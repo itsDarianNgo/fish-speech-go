@@ -74,3 +74,15 @@ func (c *Chunker) releaseFn() func() {
 		}
 	}
 }
+
+// Stream executes the provided function while holding a slot. The slot is released when the
+// function returns, allowing callers to guard streaming workloads without manual bookkeeping.
+func (c *Chunker) Stream(ctx context.Context, streamFn func(context.Context) error) error {
+	release, err := c.Acquire(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	return streamFn(ctx)
+}
