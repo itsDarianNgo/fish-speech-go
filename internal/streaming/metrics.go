@@ -7,6 +7,7 @@ import "sync/atomic"
 // still enabling consumption by Prometheus-style collectors.
 type Metrics struct {
 	activeStreams   atomic.Int64
+	limitExceeded   atomic.Int64
 	acquireTimeouts atomic.Int64
 }
 
@@ -37,6 +38,22 @@ func (m *Metrics) ActiveStreams() int64 {
 		return 0
 	}
 	return m.activeStreams.Load()
+}
+
+// IncLimitExceeded increments the counter for limit exceeded attempts.
+func (m *Metrics) IncLimitExceeded() {
+	if m == nil {
+		return
+	}
+	m.limitExceeded.Add(1)
+}
+
+// LimitExceeded reports how many attempts exceeded the stream limit.
+func (m *Metrics) LimitExceeded() int64 {
+	if m == nil {
+		return 0
+	}
+	return m.limitExceeded.Load()
 }
 
 // IncAcquireTimeouts increments the acquire timeout counter.

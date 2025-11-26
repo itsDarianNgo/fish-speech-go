@@ -6,8 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"fish-speech-go/internal/backend"
 	"fish-speech-go/internal/streaming"
@@ -37,17 +39,26 @@ type ttsBackend interface {
 type TTSHandler struct {
 	chunker *streaming.Chunker
 	backend ttsBackend
+	logger  *log.Logger
 }
 
 // NewTTSHandler constructs a new handler guarded by the provided chunker and backed by the backend client.
 func NewTTSHandler(chunker *streaming.Chunker, backend ttsBackend) *TTSHandler {
-	return &TTSHandler{chunker: chunker, backend: backend}
+	return &TTSHandler{chunker: chunker, backend: backend, logger: log.Default()}
 }
 
 // ServeHTTP validates the request and proxies it to the backend using the chunker's Stream guard.
 func (h *TTSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	h.logEvent(map[string]any{
+		"event": "tts_stream_start",
+		"path":  r.URL.Path,
+	})
+
 	payload, err := h.parseRequest(w, r)
 	if err != nil {
+		h.logStreamError(r.URL.Path, err, time.Since(start))
+		h.logStreamFinish(r.URL.Path, "error", time.Since(start), err.Error())
 		return
 	}
 
@@ -75,11 +86,15 @@ func (h *TTSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return copyErr
 	})
 
+	duration := time.Since(start)
 	if streamErr == nil {
+		h.logStreamFinish(r.URL.Path, "ok", duration, "")
 		return
 	}
 
+	h.logStreamError(r.URL.Path, streamErr, duration)
 	h.handleStreamError(w, streamErr)
+	h.logStreamFinish(r.URL.Path, "error", duration, streamErr.Error())
 }
 
 func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (ttsRequest, error) {
@@ -144,6 +159,8 @@ func (h *TTSHandler) handleStreamError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, streaming.ErrAcquireTimeout):
 		h.writeError(w, http.StatusGatewayTimeout, "acquire_timeout", "concurrent request limit reached")
+	case errors.Is(err, streaming.ErrLimitExceeded):
+		h.writeError(w, http.StatusServiceUnavailable, "limit_exceeded", "concurrent request limit reached")
 	case errors.Is(err, context.DeadlineExceeded):
 		h.writeError(w, http.StatusGatewayTimeout, "timeout", "request timed out")
 	default:
@@ -166,4 +183,60 @@ func (h *TTSHandler) writeError(w http.ResponseWriter, status int, code, message
 			"message": message,
 		},
 	})
+}
+
+func (h *TTSHandler) logStreamError(path string, err error, duration time.Duration) {
+	fields := map[string]any{
+		"event":       "tts_stream_error",
+		"path":        path,
+		"error":       err.Error(),
+		"duration_ms": duration.Milliseconds(),
+	}
+
+	if code := h.chunkerErrorCode(err); code != "" {
+		fields["chunker_error_code"] = code
+	}
+
+	h.logEvent(fields)
+}
+
+func (h *TTSHandler) logStreamFinish(path, status string, duration time.Duration, errMessage string) {
+	fields := map[string]any{
+		"event":       "tts_stream_finish",
+		"path":        path,
+		"status":      status,
+		"duration_ms": duration.Milliseconds(),
+	}
+
+	if errMessage != "" {
+		fields["error"] = errMessage
+	}
+
+	h.logEvent(fields)
+}
+
+func (h *TTSHandler) chunkerErrorCode(err error) string {
+	switch {
+	case errors.Is(err, streaming.ErrLimitExceeded):
+		return "limit_exceeded"
+	case errors.Is(err, streaming.ErrAcquireTimeout):
+		return "acquire_timeout"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	default:
+		return ""
+	}
+}
+
+func (h *TTSHandler) logEvent(fields map[string]any) {
+	if h.logger == nil {
+		return
+	}
+
+	payload, err := json.Marshal(fields)
+	if err != nil {
+		h.logger.Printf("event=serialize_error err=%v", err)
+		return
+	}
+	h.logger.Printf("%s", payload)
 }
