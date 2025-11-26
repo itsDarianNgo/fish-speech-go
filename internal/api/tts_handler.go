@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"fish-speech-go/internal/backend"
+	"fish-speech-go/internal/queue"
 	"fish-speech-go/internal/streaming"
 )
 
@@ -39,12 +40,16 @@ type ttsBackend interface {
 type TTSHandler struct {
 	chunker *streaming.Chunker
 	backend ttsBackend
-	logger  *log.Logger
+	queue   *queue.Manager
 }
 
 // NewTTSHandler constructs a new handler guarded by the provided chunker and backed by the backend client.
-func NewTTSHandler(chunker *streaming.Chunker, backend ttsBackend) *TTSHandler {
-	return &TTSHandler{chunker: chunker, backend: backend, logger: log.Default()}
+func NewTTSHandler(chunker *streaming.Chunker, backend ttsBackend, manager *queue.Manager) *TTSHandler {
+	if manager == nil {
+		manager = queue.NewManager(queue.Config{Workers: 1, MaxQueue: 0})
+	}
+
+	return &TTSHandler{chunker: chunker, backend: backend, queue: manager}
 }
 
 // ServeHTTP validates the request and proxies it to the backend using the chunker's Stream guard.
@@ -67,19 +72,21 @@ func (h *TTSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	streamErr := h.chunker.Stream(r.Context(), func(ctx context.Context) error {
-		resp, err := h.backend.StreamTTS(ctx, payload)
-		if err != nil {
-			return err
-		}
-		defer resp.Body.Close()
+	streamErr := h.queue.Submit(r.Context(), func(ctx context.Context) error {
+		return h.chunker.Stream(ctx, func(ctx context.Context) error {
+			resp, err := h.backend.StreamTTS(ctx, backendReq)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
 
-		if ct := resp.Header.Get("Content-Type"); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
-		w.WriteHeader(resp.StatusCode)
-		_, copyErr := io.Copy(w, resp.Body)
-		return copyErr
+			if ct := resp.Header.Get("Content-Type"); ct != "" {
+				w.Header().Set("Content-Type", ct)
+			}
+			w.WriteHeader(resp.StatusCode)
+			_, copyErr := io.Copy(w, resp.Body)
+			return copyErr
+		})
 	})
 
 	duration := time.Since(start)
@@ -88,9 +95,16 @@ func (h *TTSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.logStreamError(r.URL.Path, streamErr, duration)
-	h.handleStreamError(w, streamErr)
-	h.logStreamFinish(r.URL.Path, "error", duration, streamErr.Error())
+	h.handleProcessingError(w, streamErr)
+}
+
+// Shutdown drains the queue and waits for in-flight streams to finish or the context to expire.
+func (h *TTSHandler) Shutdown(ctx context.Context) error {
+	if h.queue == nil {
+		return nil
+	}
+
+	return h.queue.Shutdown(ctx)
 }
 
 func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (backend.TTSRequest, error) {
@@ -170,6 +184,19 @@ func (h *TTSHandler) parseRequest(w http.ResponseWriter, r *http.Request) (backe
 		TopP:        payload.TopP,
 		Temperature: payload.Temperature,
 	}, nil
+}
+
+func (h *TTSHandler) handleProcessingError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, queue.ErrQueueFull):
+		h.writeError(w, http.StatusServiceUnavailable, "queue_full", "request queue is full")
+		return
+	case errors.Is(err, queue.ErrShutdown):
+		h.writeError(w, http.StatusServiceUnavailable, "service_unavailable", "service is shutting down")
+		return
+	}
+
+	h.handleStreamError(w, err)
 }
 
 func (h *TTSHandler) handleStreamError(w http.ResponseWriter, err error) {
