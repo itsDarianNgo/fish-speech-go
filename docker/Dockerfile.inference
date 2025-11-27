@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     python3.10-dev \
     build-essential \
     portaudio19-dev \
+    libsndfile1 \
     git \
     curl \
     ffmpeg \
@@ -28,11 +29,17 @@ WORKDIR /app/fish-speech
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-# Install dependencies
+# Install dependencies in correct order
 RUN pip install --upgrade pip setuptools wheel
-RUN pip install -e .
+
+# Install PyTorch with CUDA support FIRST (before other deps)
+RUN pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu121
+
+# Install fish-speech with stable dependencies
+RUN pip install -e ".[stable]"
+
+# Install huggingface_hub for model downloads
 RUN pip install huggingface_hub
-RUN pip install torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu121
 
 # Create directories for models
 RUN mkdir -p /app/checkpoints /app/references
@@ -62,9 +69,9 @@ RUN echo '#!/bin/sh' > /app/start.sh \
     && echo 'CHECKPOINT_PATH="${CHECKPOINT_PATH:-/app/checkpoints/openaudio-s1-mini}"' >> /app/start.sh \
     && echo 'if [ -n "$HF_TOKEN" ]; then' >> /app/start.sh \
     && echo '    echo "Logging in to Hugging Face..."' >> /app/start.sh \
-    && echo '    python3 -c "import os; from huggingface_hub import login; login(token=os.environ. get('"'"'HF_TOKEN'"'"', '"'"''"'"'))"' >> /app/start.sh \
+    && echo '    python3 -c "import os; from huggingface_hub import login; login(token=os.environ.get('"'"'HF_TOKEN'"'"', '"'"''"'"'))"' >> /app/start.sh \
     && echo 'fi' >> /app/start.sh \
-    && echo 'if [ !  -f "$CHECKPOINT_PATH/config.json" ]; then' >> /app/start.sh \
+    && echo 'if [ ! -f "$CHECKPOINT_PATH/config.json" ]; then' >> /app/start.sh \
     && echo '    echo "Downloading Fish-Speech models..."' >> /app/start.sh \
     && echo '    python3 -c "import os; from huggingface_hub import snapshot_download; snapshot_download(repo_id='"'"'fishaudio/openaudio-s1-mini'"'"', local_dir=os.environ.get('"'"'CHECKPOINT_PATH'"'"', '"'"'/app/checkpoints/openaudio-s1-mini'"'"'))"' >> /app/start.sh \
     && echo '    echo "Models downloaded successfully"' >> /app/start.sh \
