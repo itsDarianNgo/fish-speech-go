@@ -1,0 +1,4 @@
+# Docker environment (contains secrets)
+docker/.env
+# Keep the example
+!docker/.env.example
