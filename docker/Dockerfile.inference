@@ -7,6 +7,7 @@ WORKDIR /app
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
+    bash \
     python3.10 \
     python3-pip \
     python3.10-venv \
@@ -22,9 +23,9 @@ RUN apt-get update && apt-get install -y \
 RUN python3 -m venv /app/venv
 ENV PATH="/app/venv/bin:$PATH"
 
-# Install Fish-Speech
+# Install dependencies
 RUN pip install --upgrade pip setuptools wheel
-RUN pip install fish-speech
+RUN pip install fish-speech huggingface_hub
 
 # Create directories
 RUN mkdir -p /app/checkpoints /app/references
@@ -42,38 +43,34 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -f http://localhost:8081/v1/health || exit 1
 
-# Create startup script inline (avoids Windows line ending issues)
-RUN cat <<'SCRIPT' > /app/start.sh
-#!/bin/bash
-set -e
+# Create startup script using echo commands (most reliable cross-platform method)
+RUN echo '#!/bin/sh' > /app/start.sh && \
+    echo 'set -e' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'CHECKPOINT_PATH="${CHECKPOINT_PATH:-/app/checkpoints/openaudio-s1-mini}"' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'if [ ! -d "$CHECKPOINT_PATH" ] || [ -z "$(ls -A $CHECKPOINT_PATH 2>/dev/null)" ]; then' >> /app/start.sh && \
+    echo '    echo "Downloading Fish-Speech models..."' >> /app/start.sh && \
+    echo '    python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"fishaudio/openaudio-s1-mini\", local_dir=\"/app/checkpoints/openaudio-s1-mini\", local_dir_use_symlinks=False)"' >> /app/start.sh && \
+    echo '    echo "Models downloaded successfully"' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'echo "Starting Fish-Speech inference server..."' >> /app/start.sh && \
+    echo 'exec python3 -m tools.api_server \' >> /app/start.sh && \
+    echo '    --listen "${FISH_SPEECH_LISTEN:-0.0.0.0:8081}" \' >> /app/start.sh && \
+    echo '    --llama-checkpoint-path "$CHECKPOINT_PATH" \' >> /app/start.sh && \
+    echo '    --decoder-checkpoint-path "$CHECKPOINT_PATH/codec.pth" \' >> /app/start.sh && \
+    echo '    --decoder-config-name modded_dac_vq \' >> /app/start.sh && \
+    echo '    --device "${FISH_SPEECH_DEVICE:-cuda}" \' >> /app/start.sh && \
+    echo '    "$@"' >> /app/start.sh && \
+    chmod +x /app/start.sh
 
-CHECKPOINT_PATH="${CHECKPOINT_PATH:-/app/checkpoints/openaudio-s1-mini}"
-
-# Check if models exist, if not download them
-if [ ! -d "$CHECKPOINT_PATH" ] || [ -z "$(ls -A "$CHECKPOINT_PATH" 2>/dev/null)" ]; then
-    echo "Downloading Fish-Speech models..."
-    pip install huggingface_hub
-    python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id=\"fishaudio/openaudio-s1-mini\",
-    local_dir=\"$CHECKPOINT_PATH\",
-    local_dir_use_symlinks=False
-)
-"
-    echo "Models downloaded successfully"
-fi
-
-# Start the inference server
-echo "Starting Fish-Speech inference server..."
-exec python3 -m tools.api_server \
-    --listen "${FISH_SPEECH_LISTEN:-0.0.0.0:8081}" \
-    --llama-checkpoint-path "$CHECKPOINT_PATH" \
-    --decoder-checkpoint-path "$CHECKPOINT_PATH/codec.pth" \
-    --decoder-config-name modded_dac_vq \
-    --device "${FISH_SPEECH_DEVICE:-cuda}" \
-    "$@"
-SCRIPT
-RUN chmod +x /app/start.sh
+# Verify script was created correctly - this will show in build output
+RUN echo "=== Verifying start.sh ===" && \
+    ls -la /app/start.sh && \
+    echo "=== Script contents ===" && \
+    cat /app/start.sh && \
+    echo "=== File type ===" && \
+    file /app/start.sh
 
 ENTRYPOINT ["/app/start.sh"]
