@@ -1,0 +1,62 @@
+
+services:
+  # Go API Server
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-unknown}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    ports:
+      - "${SERVER_PORT:-8080}:8080"
+    environment:
+      - FISH_LISTEN=0.0.0.0:8080
+      - FISH_BACKEND=http://inference:8081
+      - FISH_LOG_LEVEL=${LOG_LEVEL:-info}
+      - FISH_LOG_FORMAT=${LOG_FORMAT:-json}
+      - FISH_API_KEY=${API_KEY:-}
+      - FISH_MAX_TEXT_LENGTH=${MAX_TEXT_LENGTH:-0}
+    depends_on:
+      inference:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - fish-network
+
+  # Python Inference Backend
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.inference
+    environment:
+      - FISH_SPEECH_LISTEN=0.0.0.0:8081
+      - FISH_SPEECH_DEVICE=cuda
+      - CHECKPOINT_PATH=/app/checkpoints/openaudio-s1-mini
+    volumes:
+      - models:/app/checkpoints
+      - references:/app/references
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - fish-network
+    # Don't expose inference port externally
+    # ports:
+    #   - "8081:8081"
+
+volumes:
+  models:
+    name: fish-speech-models
+  references:
+    name: fish-speech-references
+
+networks:
+  fish-network:
+    driver: bridge
