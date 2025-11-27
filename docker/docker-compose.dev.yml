@@ -1,0 +1,22 @@
+# Development compose file - use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    environment:
+      - FISH_LOG_LEVEL=debug
+      - FISH_LOG_FORMAT=text
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount source for live reload (requires rebuild)
+      - ../go:/app/src:ro
+
+  inference:
+    # Expose inference port for debugging
+    ports:
+      - "8081:8081"

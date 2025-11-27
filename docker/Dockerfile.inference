@@ -1,0 +1,84 @@
+# Python inference backend for Fish-Speech
+# This wraps the upstream Fish-Speech server
+
+FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+
+WORKDIR /app
+
+# Install Python and system dependencies
+RUN apt-get update && apt-get install -y \
+    bash \
+    python3.10 \
+    python3-pip \
+    python3.10-venv \
+    python3.10-dev \
+    build-essential \
+    portaudio19-dev \
+    git \
+    curl \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone Fish-Speech repository (required - pip install alone doesn't work)
+RUN git clone https://github.com/fishaudio/fish-speech.git /app/fish-speech
+
+WORKDIR /app/fish-speech
+
+# Create virtual environment
+RUN python3 -m venv /app/venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# Install dependencies from the cloned repo
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install -e .
+RUN pip install huggingface_hub
+
+# Create directories for models
+RUN mkdir -p /app/checkpoints /app/references
+
+# Environment variables
+ENV PYTHONUNBUFFERED=1
+ENV FISH_SPEECH_DEVICE=cuda
+ENV FISH_SPEECH_LISTEN=0.0.0.0:8081
+ENV CHECKPOINT_PATH=/app/checkpoints/openaudio-s1-mini
+ENV HF_TOKEN=""
+
+# Expose port
+EXPOSE 8081
+
+# Health check - longer start period to allow model download
+HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
+    CMD curl -f http://localhost:8081/v1/health || exit 1
+
+# Create startup script
+RUN echo '#!/bin/sh' > /app/start.sh && \
+    echo 'set -e' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'cd /app/fish-speech' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'CHECKPOINT_PATH="${CHECKPOINT_PATH:-/app/checkpoints/openaudio-s1-mini}"' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Login to Hugging Face if token provided' >> /app/start.sh && \
+    echo 'if [ -n "$HF_TOKEN" ]; then' >> /app/start.sh && \
+    echo '    echo "Logging in to Hugging Face..."' >> /app/start.sh && \
+    echo '    python3 -c "from huggingface_hub import login; login(token=\"'"'"'\$HF_TOKEN'"'"'\")"' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo '# Download models if not present' >> /app/start.sh && \
+    echo 'if [ ! -d "$CHECKPOINT_PATH" ] || [ -z "$(ls -A $CHECKPOINT_PATH 2>/dev/null)" ]; then' >> /app/start.sh && \
+    echo '    echo "Downloading Fish-Speech models..."' >> /app/start.sh && \
+    echo '    python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id=\"fishaudio/openaudio-s1-mini\", local_dir=\"'"'"'$CHECKPOINT_PATH'"'"'\")"' >> /app/start.sh && \
+    echo '    echo "Models downloaded successfully"' >> /app/start.sh && \
+    echo 'fi' >> /app/start.sh && \
+    echo '' >> /app/start.sh && \
+    echo 'echo "Starting Fish-Speech inference server..."' >> /app/start.sh && \
+    echo 'exec python3 -m tools.api_server \' >> /app/start.sh && \
+    echo '    --listen "${FISH_SPEECH_LISTEN:-0.0.0.0:8081}" \' >> /app/start.sh && \
+    echo '    --llama-checkpoint-path "$CHECKPOINT_PATH" \' >> /app/start.sh && \
+    echo '    --decoder-checkpoint-path "$CHECKPOINT_PATH/codec.pth" \' >> /app/start.sh && \
+    echo '    --decoder-config-name modded_dac_vq \' >> /app/start.sh && \
+    echo '    --device "${FISH_SPEECH_DEVICE:-cuda}" \' >> /app/start.sh && \
+    echo '    "$@"' >> /app/start.sh && \
+    chmod +x /app/start.sh
+
+ENTRYPOINT ["/app/start.sh"]

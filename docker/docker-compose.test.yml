@@ -1,0 +1,38 @@
+# Test compose file - runs without GPU using CPU inference
+# Slower but works anywhere
+
+version: '3.8'
+
+services:
+  server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    ports:
+      - "8080:8080"
+    environment:
+      - FISH_LISTEN=0.0.0.0:8080
+      - FISH_BACKEND=http://inference:8081
+      - FISH_LOG_LEVEL=debug
+      - FISH_LOG_FORMAT=text
+    depends_on:
+      - inference
+    networks:
+      - fish-network
+
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.inference
+    environment:
+      - FISH_SPEECH_LISTEN=0.0.0.0:8081
+      - FISH_SPEECH_DEVICE=cpu
+    ports:
+      - "8081:8081"
+    networks:
+      - fish-network
+    # No GPU reservation for CPU testing
+
+networks:
+  fish-network:
+    driver: bridge
