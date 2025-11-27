@@ -1,0 +1,33 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+go/bin/
+
+# Test artifacts
+*.test
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker environment (contains secrets)
+docker/.env
+!docker/.env.example
+
+# Logs
+*.log
+
+# Models (downloaded at runtime)
+checkpoints/
+models/
