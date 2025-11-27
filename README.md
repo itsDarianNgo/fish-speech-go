@@ -1,115 +1,290 @@
 # 🐟 Fish-Speech-Go
 
-[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+A high-performance, OpenAI-compatible API server for [Fish-Speech](https://github.com/fishaudio/fish-speech) text-to-speech.
 
-High-performance Go wrapper for [Fish-Speech](https://github.com/fishaudio/fish-speech) - the state-of-the-art open-source Text-to-Speech system.
+**Run state-of-the-art TTS locally with a familiar API.**
 
-## ✨ Features
+[![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?style=flat&logo=go)](https://go.dev)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=flat&logo=docker)](docker/)
 
-- **True Streaming** - Audio starts playing immediately, not after full generation
-- **High Concurrency** - Handle 10,000+ concurrent connections
-- **Low Memory** - ~15MB vs ~200MB for Python server
-- **Fast Startup** - <100ms vs 3-5 seconds
-- **Simple Deployment** - Single binary or Docker
+## ✨ Why Fish-Speech-Go?
+
+| Feature | OpenAI TTS | Fish-Speech-Go |
+|---------|-----------|----------------|
+| **Cost** | $15/1M characters | Free (self-hosted) |
+| **Privacy** | Data sent to cloud | 100% local |
+| **Rate Limits** | Yes | No |
+| **Offline** | No | Yes |
+| **Voice Cloning** | No | Yes |
+| **API Compatibility** | - | OpenAI-compatible |
 
 ## 🚀 Quick Start
 
-### Docker (Recommended)
+### Prerequisites
+
+- Docker & Docker Compose
+- NVIDIA GPU with CUDA support
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+- Hugging Face account (free)
+
+### 1. Clone & Configure
 
 ```bash
-# Clone the repository
-git clone https://github.com/your-username/fish-speech-go.git
-cd fish-speech-go
+git clone https://github.com/fish-speech-go/fish-speech-go.git
+cd fish-speech-go/docker
+cp .env.example .env
+```
 
-# Start everything (downloads models automatically)
-cd docker
+Edit `.env` and add your Hugging Face token:
+```env
+HF_TOKEN=hf_your_token_here
+```
+
+> 📝 **Get your token:** https://huggingface.co/settings/tokens
+>
+> ⚠️ **Accept the license:** https://huggingface.co/fishaudio/openaudio-s1-mini
+
+### 2. Start Services
+
+```bash
 docker compose up -d
+```
 
-# Test it
+First run downloads models (~2GB) - takes a few minutes.
+
+### 3. Verify
+
+```bash
 curl http://localhost:8080/v1/health
 ```
 
-### From Source
+## 📖 API Reference
+
+### OpenAI-Compatible Endpoints
+
+#### Generate Speech
 
 ```bash
-# Build
-cd go
-go build -o bin/fish-server ./cmd/fish-server
-
-# Run (requires Python backend on port 8081)
-./bin/fish-server --backend http://localhost:8081
+# POST /v1/audio/speech
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "fish-speech",
+    "voice": "default",
+    "input": "Hello, world!"
+  }' \
+  --output speech.wav
 ```
 
-## 📖 Usage
-
-### Generate Speech
+#### Alternative TTS Endpoint
 
 ```bash
-# Using curl
+# POST /v1/tts
 curl -X POST http://localhost:8080/v1/tts \
   -H "Content-Type: application/json" \
   -d '{"text": "Hello, world!"}' \
-  -o output.wav
-
-# Using fish-tts CLI
-fish-tts "Hello, world!" -o output.wav
-
-# With streaming
-fish-tts "Hello, world!" --stream -o output.wav
+  --output speech.wav
 ```
 
-### Voice Cloning
+#### Health Check
 
 ```bash
-fish-tts "Hello in cloned voice" \
-  --reference voice-sample.wav \
-  --reference-text "Text spoken in the sample" \
-  -o cloned.wav
+# GET /v1/health
+curl http://localhost:8080/v1/health
+# Response: {"status": "ok"}
+```
+
+#### List Voices
+
+```bash
+# GET /v1/audio/voices
+curl http://localhost:8080/v1/audio/voices
+```
+
+### Request Parameters
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `input` / `text` | string | Text to convert to speech | required |
+| `model` | string | Model name | `fish-speech` |
+| `voice` | string | Voice ID | `default` |
+| `response_format` | string | Output format (wav, mp3) | `wav` |
+
+## 🔧 Integration Examples
+
+### Python (OpenAI SDK)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed"  # Required by SDK but not validated
+)
+
+response = client.audio.speech.create(
+    model="fish-speech",
+    voice="default",
+    input="Hello from Python!"
+)
+
+response.stream_to_file("output.mp3")
+```
+
+### JavaScript/TypeScript
+
+```typescript
+import OpenAI from 'openai';
+import fs from 'fs';
+
+const client = new OpenAI({
+  baseURL: 'http://localhost:8080/v1',
+  apiKey: 'not-needed',
+});
+
+const response = await client.audio.speech.create({
+  model: 'fish-speech',
+  voice: 'default',
+  input: 'Hello from JavaScript!',
+});
+
+const buffer = Buffer.from(await response.arrayBuffer());
+fs.writeFileSync('output.mp3', buffer);
+```
+
+### Go
+
+```go
+package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "io"
+    "net/http"
+    "os"
+)
+
+func main() {
+    payload := map[string]string{
+        "input": "Hello from Go!",
+        "model": "fish-speech",
+        "voice": "default",
+    }
+    body, _ := json.Marshal(payload)
+
+    resp, _ := http.Post(
+        "http://localhost:8080/v1/audio/speech",
+        "application/json",
+        bytes.NewReader(body),
+    )
+    defer resp.Body.Close()
+
+    out, _ := os.Create("output.wav")
+    defer out.Close()
+    io.Copy(out, resp.Body)
+}
+```
+
+### cURL
+
+```bash
+curl -X POST http://localhost:8080/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "fish-speech",
+    "voice": "default",
+    "input": "Hello from the command line!"
+  }' \
+  --output speech.mp3
 ```
 
 ## ⚙️ Configuration
 
-### Environment Variables
+Configure via environment variables in `docker/.env`:
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| FISH_LISTEN | 0.0.0.0:8080 | Server listen address |
-| FISH_BACKEND | http://127.0.0.1:8081 | Python backend URL |
-| FISH_API_KEY | (none) | API key for authentication |
-| FISH_LOG_LEVEL | info | Log level (debug, info, warn, error) |
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HF_TOKEN` | Hugging Face API token | **required** |
+| `SERVER_PORT` | Go server port | `8080` |
+| `API_KEY` | Optional API key for authentication | (none) |
+| `LOG_LEVEL` | Log level: debug, info, warn, error | `info` |
+| `LOG_FORMAT` | Log format: json, text | `json` |
+| `MAX_TEXT_LENGTH` | Max input length (0 = unlimited) | `0` |
 
-### CLI Flags
+## 🏗️ Architecture
 
-```bash
-fish-server \
-  --listen 0.0.0.0:8080 \
-  --backend http://localhost:8081 \
-  --api-key your-secret-key \
-  --log-level debug
+```
+┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│   Your App       │────▶│   Go Server      │────▶│   Fish-Speech    │
+│   (Client)       │◀────│   (Port 8080)    │◀────│   (Port 8081)    │
+└──────────────────┘     └──────────────────┘     └──────────────────┘
+      HTTP/JSON            Fast API Layer           ML Inference
+                           OpenAI-Compatible        GPU (CUDA)
 ```
 
-## 🧪 Testing
+**Why this design?**
+- **Go** handles HTTP, routing, validation, auth, logging (what Go does best)
+- **Python** handles ML inference, GPU operations (what Python does best)
+- **Result:** Fast, scalable, production-ready TTS
 
-```bash
-# Unit tests
-cd go && go test ./...
+## 📁 Project Structure
 
-# Integration tests (requires Docker)
-./scripts/run-integration-tests.ps1  # Windows
-./scripts/run-integration-tests.sh   # Linux/Mac
+```
+fish-speech-go/
+├── go/                      # Go API server
+│   ├── cmd/fish-server/     # Main entrypoint
+│   ├── cmd/fish-tts/        # CLI client for TTS
+│   ├── cmd/fish-ctl/        # Management CLI
+│   ├── internal/            # Core packages (api, backend, config, schema)
+│   └── go.mod
+├── docker/
+│   ├── Dockerfile.server    # Go server image
+│   ├── Dockerfile.inference # Fish-Speech image
+│   ├── docker-compose.yml
+│   ├── .env.example         # Example configuration
+│   └── .env                 # Your local config (gitignored)
+├── docs/                    # Additional documentation
+├── scripts/                 # Helper scripts
+├── LICENSE
+└── README.md
 ```
 
-## 📚 Documentation
+## 🛠️ Development
 
-- Architecture - System design and components
-- API Reference - Complete API specification
-- Compatibility Tests - Test cases
+### Run Go Tests
 
-## 📄 License
+```bash
+cd go
+go test ./...
+```
 
-Apache 2.0 - See LICENSE for details.
+### Build Go Binary
+
+```bash
+cd go
+go build -o bin/server ./cmd/fish-server
+```
+
+### Build Docker Images
+
+```bash
+cd docker
+docker compose build
+```
+
+## 🤝 Contributing
+
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## 📜 License
+
+MIT License - see [LICENSE](LICENSE) for details.
 
 ## 🙏 Acknowledgments
 
-- fishaudio/fish-speech - The amazing TTS engine
+- [Fish-Speech](https://github.com/fishaudio/fish-speech) - The amazing TTS model
+- [fishaudio](https://github.com/fishaudio) - Model creators
+
+**⭐ Star this repo if you find it useful!**
