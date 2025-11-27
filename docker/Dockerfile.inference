@@ -43,11 +43,11 @@ EXPOSE 8081
 HEALTHCHECK --interval=30s --timeout=10s --start-period=300s --retries=3 \
     CMD curl -f http://localhost:8081/v1/health || exit 1
 
-# Create startup script using echo commands (most reliable cross-platform method)
+# Create startup script using echo commands
 RUN echo '#!/bin/sh' > /app/start.sh && \
     echo 'set -e' >> /app/start.sh && \
-    echo '' >> /app/start.sh && \
-    echo 'CHECKPOINT_PATH="${CHECKPOINT_PATH:-/app/checkpoints/openaudio-s1-mini}"' >> /app/start.sh && \
+    echo '' >> /app/start. sh && \
+    echo 'CHECKPOINT_PATH="${CHECKPOINT_PATH:-/app/checkpoints/openaudio-s1-mini}"' >> /app/start. sh && \
     echo '' >> /app/start.sh && \
     echo 'if [ ! -d "$CHECKPOINT_PATH" ] || [ -z "$(ls -A $CHECKPOINT_PATH 2>/dev/null)" ]; then' >> /app/start.sh && \
     echo '    echo "Downloading Fish-Speech models..."' >> /app/start.sh && \
@@ -55,22 +55,14 @@ RUN echo '#!/bin/sh' > /app/start.sh && \
     echo '    echo "Models downloaded successfully"' >> /app/start.sh && \
     echo 'fi' >> /app/start.sh && \
     echo '' >> /app/start.sh && \
-    echo 'echo "Starting Fish-Speech inference server..."' >> /app/start.sh && \
+    echo 'echo "Starting Fish-Speech inference server..."' >> /app/start. sh && \
     echo 'exec python3 -m tools.api_server \' >> /app/start.sh && \
     echo '    --listen "${FISH_SPEECH_LISTEN:-0.0.0.0:8081}" \' >> /app/start.sh && \
-    echo '    --llama-checkpoint-path "$CHECKPOINT_PATH" \' >> /app/start.sh && \
+    echo '    --llama-checkpoint-path "$CHECKPOINT_PATH" \' >> /app/start. sh && \
     echo '    --decoder-checkpoint-path "$CHECKPOINT_PATH/codec.pth" \' >> /app/start.sh && \
     echo '    --decoder-config-name modded_dac_vq \' >> /app/start.sh && \
     echo '    --device "${FISH_SPEECH_DEVICE:-cuda}" \' >> /app/start.sh && \
     echo '    "$@"' >> /app/start.sh && \
     chmod +x /app/start.sh
-
-# Verify script was created correctly - this will show in build output
-RUN echo "=== Verifying start.sh ===" && \
-    ls -la /app/start.sh && \
-    echo "=== Script contents ===" && \
-    cat /app/start.sh && \
-    echo "=== File type ===" && \
-    file /app/start.sh
 
 ENTRYPOINT ["/app/start.sh"]
