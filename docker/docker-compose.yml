@@ -1,4 +1,3 @@
-
 services:
   # Go API Server
   server:
@@ -34,6 +33,7 @@ services:
       - FISH_SPEECH_LISTEN=0.0.0.0:8081
       - FISH_SPEECH_DEVICE=cuda
       - CHECKPOINT_PATH=/app/checkpoints/openaudio-s1-mini
+      - HF_TOKEN=${HF_TOKEN:-}
     volumes:
       - models:/app/checkpoints
       - references:/app/references
@@ -47,9 +47,6 @@ services:
     restart: unless-stopped
     networks:
       - fish-network
-    # Don't expose inference port externally
-    # ports:
-    #   - "8081:8081"
 
 volumes:
   models:

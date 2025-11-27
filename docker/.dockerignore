@@ -18,6 +18,6 @@ coverage.html
 # Docs (not needed in container)
 docs/
 
-# Local configs
+# Local overrides (but NOT .env - docker compose needs it)
+.env.local
 *.local.yaml
-.env
